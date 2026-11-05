@@ -1,3 +1,7 @@
+-- Auto prestige: Lobby setup, upgrades, 2.5 farm/retry, 3.0 Rewards webhook, timed return.
+-- Standalone: does not load or modify titan_pphud.luau.
+-- Re-run in Lobby after a place teleport; automatic reinjection is not installed.
+-- Step 1.5 spends Gold through the game's Upgrade All button; never spends Gems.
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local TIMEOUT = 30
@@ -27,9 +31,25 @@ local function startLobbyTimer()
     end
     local timer = {jobId = game.JobId, placeId = game.PlaceId, deadline = os.clock() + 600}
     env.AutoPrestigeLobbyTimer = timer
+    local player = Players.LocalPlayer
+    local planFile = "auto_prestige_grade_" .. tostring(game.GameId) .. "_" .. tostring(player.UserId) .. ".json"
+    local plan = env.AutoPrestigeGradePlan
+    if type(readfile) == "function" then
+        local ok, saved = pcall(function() return game:GetService("HttpService"):JSONDecode(readfile(planFile)) end)
+        if ok then plan = saved end
+    end
+    if type(plan) ~= "table" or plan.userId ~= player.UserId or plan.gameId ~= game.GameId then plan = nil end
+    timer.gradePlan = plan
     print("[AUTO PRESTIGE] In mission: requesting Lobby in 600 seconds.")
     task.spawn(function()
         while env.AutoPrestigeLobbyTimer == timer and inMission() do
+            local watcher = env.AutoPrestigeRewardsWatcher
+            local gold = watcher and watcher.balance and watcher.balance()
+            if plan and type(plan.goldTarget) == "number" and plan.goldTarget > 0
+                and type(gold) == "number" and gold >= plan.goldTarget then
+                timer.reason = "Enough Gold for Grade " .. tostring(plan.targetGrade)
+                break
+            end
             local remaining = timer.deadline - os.clock()
             if remaining <= 0 then break end
             task.wait(math.min(remaining, 1))
@@ -49,7 +69,7 @@ local function startLobbyTimer()
                     post:FireServer("Functions", "Teleport")
                 end)
                 if ok then
-                    print("[AUTO PRESTIGE] 10 minutes elapsed: Lobby return requested.")
+                    print("[AUTO PRESTIGE] " .. (timer.reason or "10 minutes elapsed") .. ": Lobby return requested.")
                 else
                     warn("[AUTO PRESTIGE] Lobby request failed: " .. tostring(message))
                 end
@@ -268,6 +288,41 @@ local function upgradeAll(player, interface, equipment, values)
     end
 end
 
+local function saveNextGradePlan(player, equipment, values, potential)
+    local env = type(getgenv) == "function" and getgenv() or _G
+    local plan = {userId = player.UserId, gameId = game.GameId}
+    -- Invalidate an earlier target before attempting a fresh snapshot.
+    local file = "auto_prestige_grade_" .. tostring(game.GameId) .. "_" .. tostring(player.UserId) .. ".json"
+    local function save()
+        env.AutoPrestigeGradePlan = plan
+        if type(writefile) == "function" then
+            writefile(file, game:GetService("HttpService"):JSONEncode(plan))
+        end
+    end
+    save()
+    if potential >= 15 then return end
+    local blades = awaitPath(equipment, {"Stats", "Blades"})
+    assert(isVisible(blades), "Cannot calculate ODM target while Blades is inactive.")
+    local target, cost, count = potential + 1, 0, 0
+    for _, stat in ipairs(blades:GetChildren()) do
+        if stat:IsA("CanvasGroup") then
+            click(awaitPath(stat, {"Inner", "Interact"}))
+            task.wait(0.3)
+            local text = awaitPath(equipment, {"Stat", "Inner", "Upgrade_Values", "Current"}).Text
+            local tag = text:gsub("<[^>]*>", ""):match("%[([^%]]+)%]")
+            local level
+            for index, name in pairs(values.Pot_Tags) do if name == tag then level = index end end
+            assert(level ~= nil, "Cannot read Grade of " .. stat.Name)
+            for nextLevel = level + 1, target do cost = cost + values.Upgrade_Costs[nextLevel] end
+            count = count + 1
+        end
+    end
+    assert(count == 8 and cost > 0, "Invalid next-Grade snapshot.")
+    plan.goldTarget, plan.targetGrade = cost, values.Pot_Tags[target]
+    save()
+    print("[AUTO PRESTIGE] Step 3.5: return at " .. cost .. " Gold for Grade " .. plan.targetGrade)
+end
+
 local function readDifficulty(player)
     local gui = awaitPath(player, {"PlayerGui"})
     local interface = awaitPath(gui, {"Interface"})
@@ -297,6 +352,12 @@ local function readDifficulty(player)
         end
     end)
     assert(found, "Could not read Equipment Grade.")
+    local planned, planError = pcall(saveNextGradePlan, player, equipment, values, gradeIndex)
+    if not planned then warn("[AUTO PRESTIGE] Grade target unavailable; using 10-minute return: " .. tostring(planError)) end
+    -- Refresh the reward ledger after spending Gold, before entering the map.
+    local env = type(getgenv) == "function" and getgenv() or _G
+    local watcher = env.AutoPrestigeRewardsWatcher
+    if watcher and watcher.refreshBalance then watcher.refreshBalance() end
 
     -- Highest unlocked Missions difficulty; Freedom additionally needs Prestige 3.
     -- The live slot Prestige is unavailable here, so do not infer it from Grade.
@@ -735,6 +796,17 @@ end
 watcher.send = send
 watcher.details = matchDetails
 watcher.balance = function() return goldLedger.balance, goldLedger.gems end
+watcher.refreshBalance = function()
+    local topbar = require(ReplicatedStorage.Modules["User Interface"].Topbar)
+    for _, entry in pairs(topbar.Objects) do
+        local amount = entry.Object and entry.Object:GetAttribute("New")
+        if entry.Module == "Topbar" and validBalance(amount) then
+            if entry.Currency == "Gold" then goldLedger.balance = amount end
+            if entry.Currency == "Gems" then goldLedger.gems = amount end
+        end
+    end
+    saveGold()
+end
 print("[WEBHOOK] Client da chay; cho ket thuc tran / Rewards.")
 task.spawn(function()
     local active, sent, fingerprint, changedAt, openedAt, hiddenAt
@@ -875,6 +947,15 @@ local function startMissionFarm()
                     task.wait(0.1)
                 end
                 if active() and main.Parent and isVisible(main) then
+                    local timer = env.AutoPrestigeLobbyTimer
+                    local plan = timer and timer.gradePlan
+                    local watcher = env.AutoPrestigeRewardsWatcher
+                    local gold = watcher and watcher.balance and watcher.balance()
+                    if plan and type(plan.goldTarget) == "number" and type(gold) == "number"
+                        and gold >= plan.goldTarget then
+                        -- Let the return monitor handle this reward instead of starting another round.
+                        return
+                    end
                     local get = remote("GET")
                     if get and get:IsA("RemoteFunction") then
                         local ok, err = pcall(function() get:InvokeServer("Functions", "Retry", "Add") end)
@@ -907,19 +988,35 @@ local function startMissionFarm()
     local function bladeStatus(character)
         local characters = workspace:FindFirstChild("Characters")
         local model = characters and characters:FindFirstChild(character.Name)
+            or workspace:FindFirstChild("Rig_" .. character.Name, true) or character
         -- A missing replicated model is not proof that the blades are empty.
         if not model then return nil, nil end
-        local count, segments = 0, 0
+        local count, segments, slotsFound = 0, 0, 0
         for index = 1, 3 do
             local set = model:FindFirstChild("Left_" .. index, true)
-            if set and set:GetAttribute("Used") == nil then count = count + 1 end
+            if set then
+                slotsFound = slotsFound + 1
+                if not set:GetAttribute("Used") then count = count + 1 end
+            end
         end
+        if slotsFound == 0 then return nil, nil end
         local seen = {}
+        -- Equipped segments may be outside LeftHand. Scan the whole model,
+        -- excluding stored sets, so 0/3 reserves does not discard the final blade.
         for _, part in ipairs(model:GetDescendants()) do
             if part:IsA("BasePart") then
                 local index = tonumber(part.Name:match("^Blade_(%d+)$"))
+                local stored = false
+                local ancestor = part.Parent
+                while ancestor and ancestor ~= model do
+                    if ancestor.Name:match("^Left_[123]$") or ancestor.Name:match("^Right_[123]$") then
+                        stored = true
+                        break
+                    end
+                    ancestor = ancestor.Parent
+                end
                 if index and index >= 1 and index <= 7 and not seen[index]
-                    and part:GetAttribute("Broken") == nil and part.Transparency < 1 then
+                    and not stored and not part:GetAttribute("Broken") and part.Transparency < 1 then
                     seen[index] = true
                     segments = segments + 1
                 end
@@ -928,16 +1025,36 @@ local function startMissionFarm()
         return count, segments
     end
     local function getRefillPart()
-        local hq = path(workspace, {"Unclimbable", "Props", "HQ"})
-        if not hq then return nil end
-        for _, child in ipairs(hq:GetChildren()) do
-            local tanks = child:FindFirstChild("GasTanks") or (child.Name == "GasTanks" and child)
-            local refill = tanks and tanks:FindFirstChild("Refill", true)
-            if refill and refill:IsA("BasePart") then return refill end
+        -- Breach uses Objective.Breach.HQ, not the generic Props.HQ.
+        -- Resolve by name: GetChildren()[186] is not a stable identifier.
+        for _, names in ipairs({
+            {"Unclimbable", "Objective", "Breach", "HQ"},
+            {"Unclimbable", "Props", "HQ"},
+        }) do
+            local hq = path(workspace, names)
+            if hq then
+                local nearest, distance = nil, math.huge
+                local root = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+                for _, part in ipairs(hq:GetDescendants()) do
+                    if part.Name == "Refill" and part:IsA("BasePart") then
+                        local magnitude = root and (root.Position - part.Position).Magnitude or 0
+                        if magnitude < distance then nearest, distance = part, magnitude end
+                    end
+                end
+                if nearest then return nearest end
+            end
         end
     end
     local function napeOf(titan)
         return path(titan, {"Hitboxes", "Hit", "Nape"}) or titan:FindFirstChild("Nape", true)
+    end
+    local lastRefillWarning = -10
+    local emptySince, emptyCharacter
+    local function refillWarning(message)
+        if os.clock() - lastRefillWarning >= 10 then
+            lastRefillWarning = os.clock()
+            warn("[AUTO PRESTIGE] Refill: " .. message)
+        end
     end
     local function iteration()
         local character = player.Character
@@ -948,15 +1065,32 @@ local function startMissionFarm()
             return active() and player.Character == character and root.Parent == character and humanoid.Health > 0
         end
         local setsLeft, segmentsLeft = bladeStatus(character)
-        if setsLeft == nil then release(); task.wait(0.5); return end
+        if setsLeft == nil then
+            emptySince, emptyCharacter = nil, nil
+            refillWarning("Blade slots not replicated; cannot determine remaining sets.")
+            release(); task.wait(0.5); return
+        end
         if setsLeft == 0 and segmentsLeft == 0 then
+            -- Wait for a stable 0/7, not a temporary gap while blades are changing.
+            if emptyCharacter ~= character then
+                emptyCharacter, emptySince = character, os.clock()
+            elseif not emptySince then
+                emptySince = os.clock()
+            end
+            if os.clock() - emptySince < 0.5 then
+                release()
+                task.wait(0.1)
+                return
+            end
             release()
             local station, post = getRefillPart(), remote("POST")
             if station and post and post:IsA("RemoteEvent") and valid() then
                 local oldCF = root.CFrame
+                print("[AUTO PRESTIGE] Blades empty: teleporting to " .. station:GetFullName())
                 local ok, err = pcall(function()
                     root.CFrame = station.CFrame + Vector3.new(0, 3, 0)
                     root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+                    root.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
                     task.wait(1)
                     if not valid() then return end
                     post:FireServer("Attacks", "Reload", station)
@@ -965,14 +1099,21 @@ local function startMissionFarm()
                 if valid() then
                     root.CFrame = oldCF
                     root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+                    root.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
+                    print("[AUTO PRESTIGE] Reload requested; returned to previous position.")
                     -- Keep the cooldown inside the farm loop: no attacks or tween during refill.
                     local deadline = os.clock() + 1
                     while valid() and os.clock() < deadline do task.wait(0.1) end
                 end
                 if not ok then warn("[AUTO PRESTIGE] Refill failed: " .. tostring(err)) end
-            else task.wait(0.5) end
+            else
+                refillWarning(not station and "HQ refill part not found."
+                    or "POST remote or character not ready.")
+                task.wait(0.5)
+            end
             return
         end
+        emptySince, emptyCharacter = nil, nil
         local titans = workspace:FindFirstChild("Titans")
         local target, nape, nearest = nil, nil, math.huge
         if titans then
@@ -1003,10 +1144,16 @@ local function startMissionFarm()
         farm.tween = tween
         tween:Play()
         local started = os.clock()
+        local empty = false
         while valid() and os.clock() - started < duration
-            and tween.PlaybackState == Enum.PlaybackState.Playing do task.wait(0.05) end
+            and tween.PlaybackState == Enum.PlaybackState.Playing do
+            local sets, segments = bladeStatus(character)
+            if sets == 0 and segments == 0 then empty = true; break end
+            task.wait(0.1)
+        end
         tween:Cancel()
         if farm.tween == tween then farm.tween = nil end
+        if empty then root.Anchored = false; return end
         if not valid() or not nape.Parent then release(); return end
         root.Anchored = true
         local post = remote("POST")
