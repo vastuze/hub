@@ -1,9 +1,10 @@
--- Auto prestige: Lobby setup, upgrades, 2.5 farm/retry, 3.0 Rewards webhook, timed return.
--- Standalone: does not load or modify titan_pphud.luau.
--- Re-run in Lobby after a place teleport; automatic reinjection is not installed.
--- Step 1.5 spends Gold through the game's Upgrade All button; never spends Gems.
+repeat task.wait() until game:IsLoaded()
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+-- Autoexec may run before the client and game UI have initialized.
+while not game:IsLoaded() do task.wait(0.25) end
+while not Players.LocalPlayer do task.wait(0.25) end
+Players.LocalPlayer:WaitForChild("PlayerGui")
 local TIMEOUT = 30
 local stopMissionFarm
 local lobbyPlaces = {[4658598196] = 14916516914, [5310627045] = 15393230099}
@@ -229,10 +230,50 @@ local function awaitPath(root, names)
 end
 
 local function click(button)
-    assert(type(getconnections) == "function", "Executor requires getconnections for Equipment UI.")
-    local handlers = getconnections(button.MouseButton1Click)
-    assert(#handlers > 0, "No click handlers: " .. button:GetFullName())
-    for _, connection in ipairs(handlers) do connection:Fire() end
+    assert(button:IsA("GuiButton"), "Not a UI button: " .. button:GetFullName())
+    -- Instances can replicate before Effects.Hover installs their click callbacks.
+    local deadline = os.clock() + 5
+    repeat
+        if type(getconnections) == "function" then
+            for _, eventName in ipairs({"MouseButton1Click", "Activated"}) do
+                local ok, handlers = pcall(function() return getconnections(button[eventName]) end)
+                local usable = {}
+                if ok and type(handlers) == "table" then
+                    for _, connection in pairs(handlers) do
+                        local accessible, fire = pcall(function()
+                            if connection.Enabled == false then return nil end
+                            return connection.Fire
+                        end)
+                        if accessible and type(fire) == "function" then usable[#usable + 1] = connection end
+                    end
+                end
+                if #usable > 0 then
+                    -- Do not fall back after dispatch: that could buy upgrades twice.
+                    for _, connection in ipairs(usable) do
+                        if eventName == "Activated" then connection:Fire(nil, 1)
+                        else connection:Fire() end
+                    end
+                    return
+                end
+            end
+        end
+        task.wait(0.2)
+    until not button.Parent or os.clock() >= deadline
+
+    assert(button.Parent and isVisible(button), "Button unavailable for virtual input: " .. button.Name)
+    local size, position = button.AbsoluteSize, button.AbsolutePosition
+    assert(size.X > 0 and size.Y > 0, "Button has no clickable size: " .. button.Name)
+    local input = game:GetService("VirtualInputManager")
+    local x, y = position.X + size.X / 2, position.Y + size.Y / 2
+    print("[AUTO PRESTIGE] Using virtual click: " .. button:GetFullName())
+    input:SendMouseMoveEvent(x, y, game)
+    task.wait(0.05)
+    local ok, message = pcall(function()
+        input:SendMouseButtonEvent(x, y, 0, true, game, 0)
+        task.wait(0.1)
+    end)
+    input:SendMouseButtonEvent(x, y, 0, false, game, 0)
+    if not ok then error(message) end
 end
 
 local function upgradeAll(player, interface, equipment, values)
@@ -327,9 +368,29 @@ local function readDifficulty(player)
     local gui = awaitPath(player, {"PlayerGui"})
     local interface = awaitPath(gui, {"Interface"})
     local equipment = awaitPath(interface, {"Equipment"})
+    local equipmentButton = awaitPath(interface, {"Topbar", "Main", "Categories", "Equipment", "Interact"})
+    -- IsLoaded only covers Roblox loading, not the game's delayed UI setup.
+    print("[AUTO PRESTIGE] Waiting for Lobby Equipment UI initialization...")
+    while type(getconnections) == "function" do
+        local ready = false
+        for _, signal in ipairs({"MouseButton1Click", "Activated"}) do
+            local ok, handlers = pcall(function() return getconnections(equipmentButton[signal]) end)
+            if ok and type(handlers) == "table" then
+                for _, connection in pairs(handlers) do
+                    local usable, enabled = pcall(function() return connection.Enabled ~= false end)
+                    if usable and enabled then ready = true; break end
+                end
+            end
+            if ready then break end
+        end
+        if ready then break end
+        task.wait(0.25)
+        equipmentButton = awaitPath(interface, {"Topbar", "Main", "Categories", "Equipment", "Interact"})
+    end
+    task.wait(0.5)
     -- Avoid toggling an already-open Equipment menu closed on a rerun.
     if not isVisible(equipment) then
-        click(awaitPath(interface, {"Topbar", "Main", "Categories", "Equipment", "Interact"}))
+        click(equipmentButton)
         task.wait(1)
     end
     click(awaitPath(equipment, {"Categories", "Upgrades", "Main", "Interact"}))
