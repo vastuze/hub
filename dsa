@@ -4,7 +4,7 @@ local Players = game:GetService("Players")
 while not Players.LocalPlayer do task.wait(0.25) end
 local sharedEnv = type(getgenv) == "function" and getgenv() or _G
 if sharedEnv.TitanPPHudApp and sharedEnv.TitanPPHudApp.stop then sharedEnv.TitanPPHudApp.stop() end
-local app = {running = true, farm = true, retry = false, webhook = true, height = 380, distance = 2, speed = 380}
+local app = {running = true, farm = true, retry = true, webhook = true, height = 380, distance = 2, speed = 380}
 sharedEnv.TitanPPHudApp = app
 local connections = {}
 local activeTween
