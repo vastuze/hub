@@ -4,7 +4,7 @@ local Players = game:GetService("Players")
 while not Players.LocalPlayer do task.wait(0.25) end
 local sharedEnv = type(getgenv) == "function" and getgenv() or _G
 if sharedEnv.TitanPPHudApp and sharedEnv.TitanPPHudApp.stop then sharedEnv.TitanPPHudApp.stop() end
-local app = {running = true, farm = true, retry = true, webhook = true, height = 380, distance = 2, speed = 380}
+local app = {running = true, farm = true, retry = false, webhook = true, height = 380, distance = 2, speed = 380}
 sharedEnv.TitanPPHudApp = app
 local connections = {}
 local activeTween
@@ -294,19 +294,16 @@ end
   
   local Window = Utilities:Create("ScreenGui", {
       Name = "PPHUD",
-      ZIndexBehavior = Enum.ZIndexBehavior.Global,
-      IgnoreGuiInset = false,
-      ResetOnSpawn = false
+      ZIndexBehavior = Enum.ZIndexBehavior.Global
   }, {
       Utilities:Create("Frame", {
           Name = "Main",
           Size = UDim2.new(0, 600, 0, 400),
           BackgroundColor3 = Color3.fromRGB(255, 255, 255), -- Colors.Primary
           ClipsDescendants = true,
-          AnchorPoint = Vector2.new(0.5, 0.5),
           Position = UDim2.fromScale(0.5, 0.5),
-          Active = true,
-          Draggable = false
+          AnchorPoint = Vector2.new(0.5, 0.5),
+          Active = true
       }, {
           Utilities:Create("UIGradient", {
               Color = ColorSequence.new({
@@ -537,50 +534,35 @@ end
   end
 
   local ResizeButton = Window.Main.Bottom.ResizeIcon.ResizeButton
-  local TabContainer = Window.Main.Topbar.TabContainer
-  local Containers = Window.Main.Containers
-
-  -- Mobile fix: scale the whole window down so it never overflows the screen edge.
+  Window.ResetOnSpawn = false
   local mobileScale = Instance.new("UIScale")
-  mobileScale.Name = "MobileFitScale"
   mobileScale.Parent = Window.Main
-
   local function fitScreen(center)
       local camera = workspace.CurrentCamera
       if not camera then return end
       local viewport = camera.ViewportSize
-      if not viewport or viewport.X <= 0 or viewport.Y <= 0 then return end
       local size = Window.Main.Size
-      local width = math.max(size.X.Offset, 1)
-      local height = math.max(size.Y.Offset, 1)
-      -- Leave a little margin so the bottom bar and resize icon stay reachable.
-      local scaleX = (viewport.X - 24) / width
-      local scaleY = (viewport.Y - 60) / height
-      mobileScale.Scale = math.min(1, math.max(0.4, math.min(scaleX, scaleY)))
-      if center then
-          Window.Main.Position = UDim2.fromScale(0.5, 0.5)
-      end
+      mobileScale.Scale = math.min(1, math.max(1, viewport.X - 24) / math.max(size.X.Offset, 1),
+          math.max(1, viewport.Y - 70) / math.max(size.Y.Offset, 1))
+      if center then Window.Main.Position = UDim2.fromScale(0.5, 0.5) end
   end
   fitScreen(true)
   Window.Main:GetPropertyChangedSignal("Size"):Connect(function() fitScreen(false) end)
   if workspace.CurrentCamera then
       workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(function() fitScreen(true) end)
   end
-  -- Camera can be nil or swapped during loading; re-fit until it stabilizes.
-  task.spawn(function()
-      local attached
-      for _ = 1, 40 do
-          local camera = workspace.CurrentCamera
-          if camera then
-              if camera ~= attached then
-                  attached = camera
-                  camera:GetPropertyChangedSignal("ViewportSize"):Connect(function() fitScreen(true) end)
-              end
-              fitScreen(true)
-          end
-          task.wait(0.25)
-      end
+  local restore = Utilities:Create("TextButton", {
+      Name = "RestoreUI", Parent = Window, Text = "UI", TextSize = 16,
+      Font = Enum.Font.SourceSansBold, TextColor3 = Colors.PrimaryText,
+      BackgroundColor3 = Colors.Secondary, Position = UDim2.fromOffset(12, 65),
+      Size = UDim2.fromOffset(44, 36), ZIndex = 20000
+  })
+  restore.Activated:Connect(function()
+      Window.Main.Visible = true
+      fitScreen(true)
   end)
+  local TabContainer = Window.Main.Topbar.TabContainer
+  local Containers = Window.Main.Containers
 
   local SizeX = Instance.new("NumberValue", Window.Main)
   SizeX.Name = "X"
@@ -643,17 +625,17 @@ end
   local dragging = false
   local dragInput, mousePos, framePos
 
-  local function isTouch(input)
-      return input.UserInputType == Enum.UserInputType.Touch
-  end
-
-  Window.Main.InputBegan:Connect(function(input)
-      if input.UserInputType == Enum.UserInputType.MouseButton1 or isTouch(input) then
+  local dragBar = Utilities:Create("TextButton", {
+      Name = "TouchDragBar", Parent = Window.Main.Bottom, Text = "",
+      Size = UDim2.new(1, -28, 1, 0), BackgroundTransparency = 1, ZIndex = 12000
+  })
+  dragBar.InputBegan:Connect(function(input)
+      if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
           dragging = true
           dragInput = input
           mousePos = input.Position
           framePos = Window.Main.Position
-
+              
           input.Changed:Connect(function()
               if input.UserInputState == Enum.UserInputState.End then
                   dragging = false
@@ -662,8 +644,8 @@ end
       end
   end)
 
-  Window.Main.InputChanged:Connect(function(input)
-      if input.UserInputType == Enum.UserInputType.MouseMovement or isTouch(input) then
+  dragBar.InputChanged:Connect(function(input)
+      if input.UserInputType == Enum.UserInputType.MouseMovement then
           dragInput = input
       end
   end)
@@ -671,45 +653,22 @@ end
   UserInputService.InputChanged:Connect(function(input)
       if dragging and (input == dragInput or input.UserInputType == Enum.UserInputType.MouseMovement) then
           local delta = input.Position - mousePos
-          local camera = workspace.CurrentCamera
-          local viewport = camera and camera.ViewportSize or Vector2.new(1920, 1080)
+          local viewport = workspace.CurrentCamera.ViewportSize
           local centerX = framePos.X.Scale * viewport.X + framePos.X.Offset + delta.X
           local centerY = framePos.Y.Scale * viewport.Y + framePos.Y.Offset + delta.Y
-          -- Use the scaled size so the window cannot be dragged off the phone screen.
           local half = Window.Main.AbsoluteSize / 2
           Window.Main.Position = UDim2.fromOffset(
               math.clamp(centerX, half.X, math.max(half.X, viewport.X - half.X)),
-              math.clamp(centerY, half.Y, math.max(half.Y, viewport.Y - half.Y)))
+              math.clamp(centerY, half.Y + 30, math.max(half.Y + 30, viewport.Y - half.Y)))
       end
   end)
   
   function WindowTable:Exit()
       Window:Destroy()
   end
-
-  -- Floating "UI" button: mobile has no RightShift key to reopen the window.
-  local restoreButton = Utilities:Create("TextButton", {
-      Name = "RestoreUI",
-      Parent = Window,
-      Text = "UI",
-      TextSize = 15,
-      Font = Enum.Font.SourceSansBold,
-      TextColor3 = Colors.PrimaryText,
-      BackgroundColor3 = Colors.Secondary,
-      AnchorPoint = Vector2.new(0, 0),
-      Position = UDim2.new(0, 10, 0, 70),
-      Size = UDim2.fromOffset(42, 34),
-      Visible = false,
-      ZIndex = 20000
-  }, {
-      Utilities:Create("UICorner", {CornerRadius = UDim.new(0, 6)})
-  })
-  restoreButton.MouseButton1Click:Connect(function() WindowTable:Toggle() end)
-  restoreButton.Activated:Connect(function() WindowTable:Toggle() end)
   
   function WindowTable:Toggle()
       Window.Main.Visible = not Window.Main.Visible
-      if restoreButton then restoreButton.Visible = not Window.Main.Visible end
   end
   
   function WindowTable:Tab(TabArgs)
@@ -2031,361 +1990,6 @@ setup:Button({Text = "Create mission + selected modifiers", Callback = function(
     if not ok then message:Set("Create/Modify/Start failed; see console"); warn("[MISSIONS] " .. tostring(err)) end
 end})
 end
--- ===== Auto Progress: runs inside the Missions block and shares its state =====
--- PURE BEGIN
-local pgCosts = {500, 1250, 2000, 3000, 5000, 7500, 11000, 17500, 25000, 37500, 50000, 70000, 100000, 135000, 169420}
-local pgMilestones = {2, 6, 9, 12, 15}
-local function pgRoundCost(fromLevel, toLevel, statCount)
-    local total = 0
-    for level = fromLevel + 1, toLevel do total = total + (statCount or 8) * pgCosts[level] end
-    return total
-end
-local function pgGoldTarget(potential, statCount)
-    for _, milestone in ipairs(pgMilestones) do
-        if milestone > potential then return pgRoundCost(potential, milestone, statCount), milestone end
-    end
-end
--- Highest tier the grade allows. Never Freedom: S rank stays on Aberrant.
-local function pgDifficulty(potential)
-    local best
-    for _, rule in ipairs({{"Easy", 0}, {"Normal", 2}, {"Hard", 5}, {"Severe", 9}, {"Aberrant", 12}}) do
-        if potential >= rule[2] then best = rule[1] end
-    end
-    return best
-end
-local pgTags = {"No Perks", "No Skills", "No Memories", "Nightmare", "Injury Prone", "Chronic Injuries",
-    "Fog", "Glass Cannon", "Time Trial", "Fatigue", "Evolution"}
--- nil = attribute unknown, false = all present, string = first missing tag
-local function pgMissingTag(state)
-    if type(state) ~= "string" then return nil end
-    for _, tag in ipairs(pgTags) do
-        if not state:find(tag, 1, true) then return tag end
-    end
-    return false
-end
-local function pgFormat(number)
-    local text = tostring(math.floor(number)):reverse():gsub("(%d%d%d)", "%1,"):reverse()
-    return (text:gsub("^,", ""))
-end
-local function pgUpgradeText(result, nextTarget, milestone)
-    local spent = (result.goldBefore and result.goldAfter) and (result.goldBefore - result.goldAfter) or nil
-    local lines = {
-        "Grade: " .. tostring(result.gradeBefore or "?") .. " -> " .. tostring(result.gradeAfter or "?"),
-        "Upgrade All presses: " .. tostring(result.presses),
-    }
-    if spent then
-        lines[#lines + 1] = "Gold: " .. pgFormat(result.goldBefore) .. " -> " .. pgFormat(result.goldAfter)
-            .. " (-" .. pgFormat(spent) .. ")"
-    end
-    if result.maxed then
-        lines[#lines + 1] = "Upgrade All is maxed; no more lobby trips for upgrades."
-    elseif nextTarget then
-        lines[#lines + 1] = "Next target: " .. pgFormat(nextTarget) .. " Gold (level " .. tostring(milestone) .. ")"
-    end
-    if result.gradeBefore == result.gradeAfter and result.presses == 0 then
-        lines[#lines + 1] = "No upgrade happened."
-    end
-    return table.concat(lines, "\n")
-end
--- PURE END
-local pgGradeNames = {[0] = "E-", "E", "E+", "D-", "D", "D+", "C-", "C", "C+", "B-", "B", "B+", "A-", "A", "A+", "S-"}
-local pgSave = sharedEnv
-local progressTab = window:Tab({Text = "Progress"})
-local progressSection = progressTab:Section({Text = "Auto Progress", Side = "Left"})
-local progressStatus = progressSection:Label({Text = "Idle", Height = 58, Wrapped = true})
-local function setProgress(text)
-    progressStatus:Set(text)
-    print("[PROGRESS] " .. text)
-end
-local function pgShown(node)
-    if not node or not node:IsDescendantOf(game) then return false end
-    while node and node ~= game do
-        if node:IsA("GuiObject") and not node.Visible then return false end
-        if node:IsA("CanvasGroup") and node.GroupTransparency >= 0.99 then return false end
-        if node:IsA("LayerCollector") and not node.Enabled then return false end
-        node = node.Parent
-    end
-    return true
-end
-local function pgPath(node, names)
-    for _, name in ipairs(names) do node = node and node:FindFirstChild(name) end
-    return node
-end
-local function pgButton(node)
-    if not node or not pgShown(node) then return nil end
-    if node:IsA("GuiButton") then return node end
-    local interact = pgPath(node, {"Main", "Interact"}) or node:FindFirstChild("Interact")
-    if interact and interact:IsA("GuiButton") and pgShown(interact) then return interact end
-end
-local function pgFire(signal, ...)
-    local ok, handlers = pcall(function() return getconnections(signal) end)
-    if not ok or type(handlers) ~= "table" then return false end
-    local args, fired = {...}, false
-    for _, connection in ipairs(handlers) do
-        local readable, fire = pcall(function()
-            if connection.Enabled == false then return nil end
-            return connection.Fire
-        end)
-        if readable and type(fire) == "function" then
-            if not pcall(function() connection:Fire(unpack(args)) end) then
-                error("Callback loi; dung de tranh bam nham.")
-            end
-            fired = true
-        end
-    end
-    return fired
-end
-local function pgDispatch(node)
-    if type(getconnections) ~= "function" then error("Executor thieu getconnections") end
-    if not node then error("Khong co nut de bam") end
-    if pgFire(node.MouseButton1Click) then return end
-    if pgFire(node.Activated, nil, 1) then return end
-    error("Khong kich hoat duoc: " .. node:GetFullName())
-end
-local function pgAwait(label, timeout, find)
-    local deadline = os.clock() + timeout
-    repeat
-        if not app.running then error("Da dung") end
-        local result = find()
-        if result then return result end
-        task.wait(0.15)
-    until os.clock() >= deadline
-    error("Het thoi gian cho " .. label)
-end
-local function pgInterface()
-    local gui = Players.LocalPlayer:FindFirstChild("PlayerGui")
-    return gui and gui:FindFirstChild("Interface")
-end
-local function pgEquipmentButton(interface)
-    local topbar = interface:FindFirstChild("Topbar")
-    if not topbar then return nil end
-    local found, seen = {}, {}
-    for _, node in ipairs(topbar:GetDescendants()) do
-        if node.Name == "Equipment" then
-            local button = pgButton(node)
-            if button and not seen[button] then found[#found + 1], seen[button] = button, true end
-        end
-    end
-    if #found > 1 then error("Nhieu nut Equipment; can Copy Path") end
-    return found[1]
-end
-local function pgOpenEquipment()
-    local interface = pgAwait("Interface", 15, pgInterface)
-    local equipment = interface:FindFirstChild("Equipment")
-    if not pgShown(equipment) then
-        pgDispatch(pgAwait("nut Equipment", 10, function() return pgEquipmentButton(interface) end))
-        equipment = pgAwait("Equipment hien", 15, function()
-            local node = interface:FindFirstChild("Equipment")
-            return pgShown(node) and node
-        end)
-    end
-    return interface, equipment
-end
-local function pgReadPotential()
-    local title = pgPath(pgInterface(), {"Equipment", "Categories", "Upgrades", "Main", "Title"})
-    local text = title and title.Text or ""
-    text = text:gsub("<[^>]*>", ""):upper()
-    local grade = text:match("%[([A-S][%+%-]?)%s+GRADE%]") or text:match("%[GRADE%s+([A-S][%+%-]?)%]")
-    for index = 0, 15 do
-        if pgGradeNames[index] == grade then return index, grade end
-    end
-end
-local function pgNotify(title, text)
-    if not webhookSend then return end
-    task.spawn(function()
-        for _ = 1, 3 do
-            local ok, reason, delay = webhookSend({{name = title, value = text, inline = false}})
-            if ok or reason == "Webhook disabled" then return end
-            print("[PROGRESS] Webhook that bai: " .. tostring(reason))
-            task.wait(math.min(delay or 5, 15))
-        end
-    end)
-end
-local pgState = {enabled = false, busy = false, prestige = false, lastFailure = nil, retriedMission = nil}
-local function pgUpgradeAll()
-    local interface, equipment = pgOpenEquipment()
-    local statsButton = pgAwait("Upgrades", 10, function()
-        local categories = pgButton(pgPath(equipment, {"Categories", "Upgrades"}))
-        return categories
-    end)
-    pgDispatch(statsButton)
-    task.wait(1)
-    local before, gradeBefore = pgReadPotential()
-    local goldBefore = readLiveGold()
-    local presses, maxed = 0, false
-    for _ = 1, 20 do
-        local all = pgButton(pgPath(equipment, {"Stats", "All"}))
-        if not all then maxed = presses > 0 or maxed; break end
-        local potentialNow = pgReadPotential()
-        local goldNow = readLiveGold()
-        pgDispatch(all)
-        -- Wait for the game to refresh grade/gold; stop if nothing changed (cannot afford more).
-        local changed = false
-        for _ = 1, 20 do
-            task.wait(0.15)
-            if pgReadPotential() ~= potentialNow or readLiveGold() ~= goldNow then changed = true; break end
-        end
-        if not changed then break end
-        presses = presses + 1
-    end
-    task.wait(0.5)
-    local after, gradeAfter = pgReadPotential()
-    return {potentialBefore = before, potentialAfter = after, gradeBefore = gradeBefore, gradeAfter = gradeAfter,
-        goldBefore = goldBefore, goldAfter = readLiveGold(), presses = presses, maxed = maxed}
-end
-local function pgCards(playerGui, category)
-    local result, seen = {}, {}
-    for _, info in ipairs(playerGui:GetDescendants()) do
-        if info:GetAttribute("Category") == category and info:GetAttribute("Tag") ~= nil and pgShown(info) then
-            local card = info.Parent
-            for _ = 1, 10 do
-                if not card then break end
-                local detector = card:FindFirstChild("Click")
-                if detector and detector:IsA("ClickDetector") then
-                    if not seen[detector] and card.Name ~= "Empty" then
-                        seen[detector] = true
-                        result[#result + 1] = {click = detector, name = card.Name, tag = tostring(info:GetAttribute("Tag"))}
-                    end
-                    break
-                end
-                card = card.Parent
-            end
-        end
-    end
-    return result
-end
-local function pgPrestigeYes(interface)
-    for _, label in ipairs(interface:GetDescendants()) do
-        if (label:IsA("TextLabel") or label:IsA("TextButton")) and pgShown(label)
-            and label.Text:lower():gsub("%s+", " "):find("are you sure you want to prestige", 1, true) then
-            local container = label.Parent
-            for _ = 1, 4 do
-                if not container or container == interface then break end
-                local matches = {}
-                for _, node in ipairs(container:GetDescendants()) do
-                    if (node:IsA("TextLabel") or node:IsA("TextButton")) and pgShown(node)
-                        and node.Text:lower() == "yes" then
-                        local button = node
-                        while button and button ~= container and not button:IsA("GuiButton") do button = button.Parent end
-                        if button and button:IsA("GuiButton") and pgShown(button) then matches[#matches + 1] = button end
-                    end
-                end
-                if #matches > 1 then error("Nhieu nut YES trong hop thoai Prestige") end
-                if #matches == 1 then return matches[1] end
-                container = container.Parent
-            end
-        end
-    end
-end
--- Equipment > Prestige > button > YES > Gold Boost > random Talent > Finish. One attempt, no reroll.
-local function pgPrestige()
-    local interface, equipment = pgOpenEquipment()
-    local before = Players.LocalPlayer:GetAttribute("Prestige")
-    pgDispatch(pgAwait("muc Prestige", 10, function()
-        return pgButton(pgPath(equipment, {"Categories", "Prestige"}))
-    end))
-    pgDispatch(pgAwait("nut Prestige", 15, function()
-        return pgButton(pgPath(equipment, {"Prestige", "B_Prestige"}))
-    end))
-    pgDispatch(pgAwait("YES xac nhan Prestige", 15, function() return pgPrestigeYes(interface) end))
-    local playerGui = Players.LocalPlayer:WaitForChild("PlayerGui")
-    local gold = pgAwait("the Gold Boost", 90, function()
-        local matches = {}
-        for _, card in ipairs(pgCards(playerGui, "Boosts")) do
-            if card.tag == "3" and card.name == "Gold Boost" then matches[#matches + 1] = card end
-        end
-        return #matches == 1 and matches[1]
-    end)
-    task.wait(2)
-    pgDispatch(gold.click)
-    pgDispatch(pgAwait("xac nhan Gold Boost", 10, function()
-        return pgButton(pgPath(interface, {"Memories_Buttons", "M_Confirm"}))
-    end))
-    local talents = pgAwait("Talent server dua ra", 30, function()
-        local cards = pgCards(playerGui, "Talents")
-        return #cards > 0 and cards
-    end)
-    task.wait(2)
-    talents = pgCards(playerGui, "Talents")
-    if #talents == 0 then error("Talent da bien mat; dung") end
-    local talent = talents[math.random(1, #talents)]
-    setProgress("Prestige: chon Talent " .. talent.name)
-    pgDispatch(talent.click)
-    pgDispatch(pgAwait("Finish", 10, function()
-        local button = pgButton(pgPath(interface, {"Memories_Buttons", "M_Confirm"}))
-        local title = button and button:FindFirstChild("Title")
-        return title and title.Text:upper() == "FINISH" and button
-    end))
-    pgAwait("Prestige tang", 45, function()
-        local now = Players.LocalPlayer:GetAttribute("Prestige")
-        return type(before) == "number" and type(now) == "number" and now > before
-    end)
-    pgNotify("Prestige done", "Gold Boost + " .. talent.name .. " (prestige " .. tostring(before) .. " -> " .. tostring(Players.LocalPlayer:GetAttribute("Prestige")) .. ")")
-end
--- Decision loop. Only acts on this server's state; failures stop with a message.
-local pgUIToggle = progressSection:Check({Text = "Auto Progress (off by default)", Callback = function(value)
-    pgState.enabled = value
-    setProgress(value and "Auto Progress on; waiting for grade" or "Auto Progress off")
-end})
-pgUIToggle:Set(false)
-local pgPrestigeToggle = progressSection:Check({Text = "Auto Prestige at S- (one attempt)", Callback = function(value)
-    pgState.prestige = value
-end})
-pgPrestigeToggle:Set(false)
-task.spawn(function()
-    while app.running do
-        task.wait(1)
-        if not pgState.enabled or pgState.busy then continue end
-        local ok, err = pcall(function()
-            local potential, grade = pgReadPotential()
-            if not potential then
-                setProgress("Grade unknown: open Equipment > Upgrades")
-                return
-            end
-            if not atLobby() then
-                setProgress("Waiting in lobby (grade " .. grade .. ")")
-                return
-            end
-            if potential >= 15 then
-                if pgState.prestige and not pgState.doneS then
-                    pgState.busy = true
-                    setProgress("S- reached: auto prestige")
-                    pgPrestige()
-                    pgState.doneS = true
-                    pgState.busy = false
-                    return
-                end
-                setProgress("S- reached; staying on Aberrant")
-                return
-            end
-            local target, milestone = pgGoldTarget(potential, 8)
-            local gold = readLiveGold()
-            if not target then return end
-            if not gold or gold < target then
-                setProgress("Grade " .. grade .. ": need " .. pgFormat(target) .. " Gold for level " .. milestone
-                    .. " (have " .. pgFormat(gold or 0) .. ")")
-                return
-            end
-            pgState.busy = true
-            setProgress("Upgrading from " .. grade)
-            local result = pgUpgradeAll()
-            local _, gradeNow = pgReadPotential()
-            local nextTarget, nextMilestone = pgGoldTarget(pgReadPotential() or potential, 8)
-            pgNotify("Upgrade All result", pgUpgradeText({
-                gradeBefore = result.gradeBefore, gradeAfter = gradeNow or result.gradeAfter,
-                goldBefore = result.goldBefore, goldAfter = result.goldAfter,
-                presses = result.presses, maxed = result.maxed,
-            }, nextTarget, nextMilestone))
-            setProgress("Upgrade done: " .. tostring(gradeNow or result.gradeAfter))
-            pgState.busy = false
-        end)
-        if not ok then
-            pgState.busy = false
-            setProgress("Stopped: " .. tostring(err))
-            task.wait(4)
-        end
-    end
-end)
 tab:Select()
 startAutomation()
 -- Independent tracker: lobby has no Titans folder.
@@ -2934,26 +2538,22 @@ local function refillBlades(character, root)
     local function valid()
         return app.farm and player.Character == character and root.Parent == character
     end
-    -- Keep the character anchored for the whole refill so it never falls.
-    root.Anchored = true
+    root.Anchored = false
     local ok = pcall(function()
-        root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
         root.CFrame = station.CFrame + Vector3.new(0, 3, 0)
+        root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
         task.wait(1)
         if not valid() then return end
         post:FireServer("Attacks", "Reload", station)
         task.wait(0.5)
     end)
     if valid() then
-        -- Return to the original spot and keep hovering there.
         root.CFrame = oldCF
         root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
         -- Cooldown stays inside the farm loop: no tween/attacks during refill.
         local deadline = os.clock() + 5
         while valid() and os.clock() < deadline do task.wait(0.1) end
     end
-    -- Release only if the farm is stopping; the farm loop unanchors before tweening.
-    if root.Parent == character and not app.farm then root.Anchored = false end
     if not ok then warn("[REFILL] Reload failed; will retry after cooldown.") end
 end
 
@@ -3059,7 +2659,7 @@ while app.running do
 
     local titan, nape = getTarget()
     if not titan or not nape then
-        -- Stay in the air while waiting for a target instead of falling.
+        root.Anchored = false
         task.wait(0.5)
         continue
     end
@@ -3081,16 +2681,15 @@ while app.running do
 
         local curSets, curSegments = getBladeStatus()
         if curSets == nil or (curSets == 0 and curSegments == 0) then
-            -- Blades empty: stay anchored so we do not fall before refillBlades runs.
-            root.Anchored = true
+            root.Anchored = false
             break
         end
 
         if not nape or not nape.Parent then
             nape = getNape(titan)
         end
-        if not nape then
-            -- Target's nape vanished: keep hovering instead of dropping.
+        if not nape then 
+            root.Anchored = false
             break 
         end
 
@@ -3135,36 +2734,30 @@ while app.running do
 
         root.Anchored = true
 
-        -- Blade attack: remote chain, then a real mouse click so the nape hit counts.
-        -- Slash true -> Hitboxes Register with a float -> Slash false.
+        -- ================= BỔ SUNG REGISTER & CLICK CHUỘT VÀO ĐÂY =================
         local attackRemote = automationRemote("POST")
-        local attackOK = pcall(function()
-            assert(attackRemote and attackRemote:IsA("RemoteEvent"), "POST unavailable")
-            attackRemote:FireServer("Attacks", "Slash", true)
-            task.wait(0.05)
-            attackRemote:FireServer("Hitboxes", "Register", nape, math.random() * 0.2 + 0.1)
-            task.wait(0.05)
-            attackRemote:FireServer("Attacks", "Slash", false)
-        end)
-        if not attackOK then
-            root.Anchored = false
-            warn("[ATTACK] Slash remote call failed; stopping Auto Farm.")
-            app.farm = false
-            break
+        if attackRemote and attackRemote:IsA("RemoteEvent") then
+            pcall(function()
+                attackRemote:FireServer("Attacks", "Slash", true)
+                attackRemote:FireServer("Hitboxes", "Register", nape, math.random() * 0.1 + 0.05)
+                attackRemote:FireServer("Attacks", "Slash", false)
+            end)
         end
-
-        -- Mouse click is what makes the game count the nape hit.
-        VirtualInputManager:SendMouseButtonEvent(0, 0, 0, true, game, 0)
-        task.wait(0.05)
-        VirtualInputManager:SendMouseButtonEvent(0, 0, 0, false, game, 0)
+        
+        -- Giả lập click chuột trái
+        pcall(function()
+            VirtualInputManager:SendMouseButtonEvent(0, 0, 0, true, game, 0)
+            task.wait(0.05)
+            VirtualInputManager:SendMouseButtonEvent(0, 0, 0, false, game, 0)
+        end)
+        -- =========================================================================
 
         task.wait(0.15)
         hum = titan:FindFirstChild("Humanoid")
     end
     
     if root then
-        -- Keep anchored while blades are empty; refillBlades needs the character to stay in the air.
-        if not app.farm then root.Anchored = false end
+        root.Anchored = false
     end
 end
 end)
