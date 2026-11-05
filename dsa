@@ -1,1581 +1,98 @@
--- Integrated PPHud + existing farm + Rewards webhook. Run this file only.
-while not game:IsLoaded() do task.wait(0.25) end
+-- Auto prestige: Lobby setup, upgrades, mission creation, 2.5 farm/retry, timed return.
+-- Standalone: does not load or modify titan_pphud.luau.
+-- Re-run in Lobby after a place teleport; automatic reinjection is not installed.
+-- Step 1.5 spends Gold through the game's Upgrade All button; never spends Gems.
 local Players = game:GetService("Players")
-while not Players.LocalPlayer do task.wait(0.25) end
-local sharedEnv = type(getgenv) == "function" and getgenv() or _G
-if sharedEnv.TitanPPHudApp and sharedEnv.TitanPPHudApp.stop then sharedEnv.TitanPPHudApp.stop() end
-local app = {running = true, farm = true, retry = true, webhook = true, height = 380, distance = 2, speed = 380}
-sharedEnv.TitanPPHudApp = app
-local connections = {}
-local activeTween
-local window
-local webhookSend, webhookDetails, webhookBalance
-local function releaseCharacter()
-    if activeTween then activeTween:Cancel(); activeTween = nil end
-    local character = Players.LocalPlayer.Character
-    local root = character and character:FindFirstChild("HumanoidRootPart")
-    if root then root.Anchored = false end
-    game:GetService("UserInputService").MouseBehavior = Enum.MouseBehavior.Default
-end
-function app.stop()
-    app.running, app.farm, app.retry = false, false, false
-    if app.watcher and sharedEnv.RewardsWebhookWatcher == app.watcher then sharedEnv.RewardsWebhookWatcher = nil end
-    for _, connection in ipairs(connections) do connection:Disconnect() end
-    releaseCharacter()
-    if window then pcall(function() window:Exit() end) end
-end
--- Embedded by build_titan_ui.py; app/sharedEnv/releaseCharacter come from host.
-local automationFile = "titan_automation_" .. tostring(game.GameId) .. "_" .. tostring(Players.LocalPlayer.UserId) .. ".json"
-local automationHttp = game:GetService("HttpService")
-app.autoLeave, app.autoUpgrade, app.goldTarget, app.maxGames = false, false, 1, 8
-app.gameCount, app.leaving = 0, false
-local countedJob, upgradePending
-local warnedStorage = false
-local function finiteNumber(value)
-    return type(value) == "number" and value == value and value > -math.huge and value < math.huge
-end
-local function integerInRange(value, minimum, maximum)
-    return finiteNumber(value) and value % 1 == 0 and value >= minimum and value <= maximum
-end
-if type(readfile) == "function" then
-    local ok, data = pcall(function() return automationHttp:JSONDecode(readfile(automationFile)) end)
-    if ok and type(data) == "table" then
-        app.autoLeave = data.autoLeave == true
-        app.autoUpgrade = data.autoUpgrade == true
-        if integerInRange(data.goldTarget, 1, 1000000000) then app.goldTarget = data.goldTarget end
-        if integerInRange(data.maxGames, 1, 1000000) then app.maxGames = data.maxGames end
-        if integerInRange(data.gameCount, 0, 1000000) then app.gameCount = data.gameCount end
-        countedJob = type(data.countedJob) == "string" and data.countedJob or nil
-        upgradePending = data.upgradePending == true
-    end
-end
-local function saveAutomation()
-    local ok = false
-    if type(writefile) == "function" then
-        ok = pcall(function()
-            writefile(automationFile, automationHttp:JSONEncode({autoLeave = app.autoLeave,
-                autoUpgrade = app.autoUpgrade, goldTarget = app.goldTarget, maxGames = app.maxGames,
-                gameCount = app.gameCount, countedJob = countedJob, upgradePending = upgradePending}))
-        end)
-    end
-    if not ok and not warnedStorage then
-        warnedStorage = true
-        warn("[TITAN UI] Cannot persist automation settings; teleport requires writefile/readfile.")
-    end
-end
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TIMEOUT = 30
+local stopMissionFarm
 local lobbyPlaces = {[4658598196] = 14916516914, [5310627045] = 15393230099}
-local function atLobby()
-    return lobbyPlaces[game.GameId] == game.PlaceId
-end
-local function automationRemote(name)
-    local storage = game:GetService("ReplicatedStorage")
-    local assets = storage:FindFirstChild("Assets")
-    local remotes = assets and assets:FindFirstChild("Remotes")
-    return remotes and remotes:FindFirstChild(name)
-end
-local function leaveReason()
-    if atLobby() then return nil end
-    if app.autoUpgrade and finiteNumber(app.goldBalance) and app.goldBalance >= app.goldTarget then return "gold" end
-    if app.autoLeave and app.gameCount >= app.maxGames then return "games" end
-end
-app.shouldLeave = function() return app.leaving or leaveReason() ~= nil end
-local function requestLobby(reason)
-    if app.leaving or not app.running or atLobby() then return false end
-    local post = automationRemote("POST")
-    local character = Players.LocalPlayer.Character
-    if not post or not post:IsA("RemoteEvent") or not character or not character:FindFirstChild("HumanoidRootPart") then return false end
-    app.leaving = true
-    local previousFarm = app.farm
-    app.farm = false
-    releaseCharacter()
-    -- Keep the upgrade intent through teleport; persist before invoking game.
-    local previousPending = upgradePending
-    if reason == "gold" then upgradePending = true end
-    saveAutomation()
-    local ok = pcall(function() post:FireServer("Functions", "Teleport") end)
-    if not ok then
-        upgradePending = previousPending
-        app.leaving, app.farm = false, previousFarm
-        saveAutomation()
-        warn("[TITAN UI] Teleport call failed; will retry.")
-        return false
+local missionPlaces = {
+    [4658598196] = {13379349730, 14012874501, 14638336319, 13904207646,
+        15220308770, 17688739434, 15824912319, 126678335159530, 112374853034490},
+    [5310627045] = {17373821193, 15393230324, 17373828240, 17373824844,
+        18182863694, 110415968652032, 139092911630535, 133979984250876, 85939958627504},
+}
+
+local function inMission()
+    for _, placeId in ipairs(missionPlaces[game.GameId] or {}) do
+        if game.PlaceId == placeId then return true end
     end
-    print("[TITAN UI] Requested lobby: " .. reason)
-    -- FireServer is not confirmation; failed teleports may be retried after 15s.
+    return false
+end
+
+local function startLobbyTimer()
+    local env = type(getgenv) == "function" and getgenv() or _G
+    local previous = env.AutoPrestigeLobbyTimer
+    -- Re-executing in the same server must not reset or duplicate the timer.
+    if previous and previous.jobId == game.JobId and previous.placeId == game.PlaceId then
+        print("[AUTO PRESTIGE] 10-minute Lobby timer already active.")
+        return
+    end
+    local timer = {jobId = game.JobId, placeId = game.PlaceId, deadline = os.clock() + 600}
+    env.AutoPrestigeLobbyTimer = timer
+    print("[AUTO PRESTIGE] In mission: requesting Lobby in 600 seconds.")
     task.spawn(function()
-        task.wait(15)
-        if app.running and not atLobby() then app.leaving, app.farm = false, previousFarm end
+        while env.AutoPrestigeLobbyTimer == timer and inMission() do
+            local remaining = timer.deadline - os.clock()
+            if remaining <= 0 then break end
+            task.wait(math.min(remaining, 1))
+        end
+        while env.AutoPrestigeLobbyTimer == timer and inMission() do
+            timer.leaving = true
+            if stopMissionFarm then stopMissionFarm() end
+            local assets = ReplicatedStorage:FindFirstChild("Assets")
+            local remotes = assets and assets:FindFirstChild("Remotes")
+            local post = remotes and remotes:FindFirstChild("POST")
+            local player = Players.LocalPlayer
+            local character = player and player.Character
+            local root = character and character:FindFirstChild("HumanoidRootPart")
+            if post and post:IsA("RemoteEvent") and root then
+                root.Anchored = false
+                local ok, message = pcall(function()
+                    post:FireServer("Functions", "Teleport")
+                end)
+                if ok then
+                    print("[AUTO PRESTIGE] 10 minutes elapsed: Lobby return requested.")
+                else
+                    warn("[AUTO PRESTIGE] Lobby request failed: " .. tostring(message))
+                end
+                -- FireServer is not confirmation. Retry only after 15 seconds.
+                task.wait(15)
+            else
+                task.wait(1)
+            end
+        end
+        if env.AutoPrestigeLobbyTimer == timer then env.AutoPrestigeLobbyTimer = nil end
     end)
+end
+
+local function waitForValue(callback)
+    local deadline = os.clock() + TIMEOUT
+    repeat
+        local value = callback()
+        if value then return value end
+        task.wait(0.25)
+    until os.clock() >= deadline
+    return nil
+end
+
+local function isVisible(button)
+    if not button.Parent then return false end
+    local node = button
+    while node and node ~= game do
+        if (node:IsA("GuiObject") and not node.Visible)
+            or (node:IsA("CanvasGroup") and node.GroupTransparency >= 0.99)
+            or (node:IsA("ScreenGui") and not node.Enabled) then
+            return false
+        end
+        node = node.Parent
+    end
     return true
 end
-local upgradeList = {"Blade_Durability", "ODM_Damage", "ODM_Gas", "ODM_Range", "ODM_Control", "Crit_Chance", "Crit_Damage", "ODM_Speed"}
-local function readLiveGold()
-    local node = Players.LocalPlayer:FindFirstChild("PlayerGui")
-    for _, name in ipairs({"Interface", "Topbar", "Main", "Currencies", "Gold", "Amount"}) do node = node and node:FindFirstChild(name) end
-    if not node then return nil end
-    return tonumber((node.Text:gsub(",", ""):gsub("%s", "")))
-end
-local function startAutomation()
-    task.spawn(function()
-        local nextAction, lobbySince = 0, nil
-        local upgradeAttempted = false
-        while app.running do
-            task.wait(0.25)
-            local ok = pcall(function()
-                local now = os.clock()
-                if atLobby() then
-                    lobbySince = lobbySince or now
-                    if app.gameCount ~= 0 then app.gameCount = 0; saveAutomation() end
-                    local liveGold = readLiveGold()
-                    if app.autoUpgrade and not upgradeAttempted and finiteNumber(liveGold)
-                        and liveGold >= app.goldTarget and now - lobbySince >= 2 then
-                        local remote = automationRemote("GET")
-                        if remote and remote:IsA("RemoteFunction") then
-                            -- Once per lobby visit, not a loop that spends repeatedly.
-                            upgradeAttempted = true
-                            local invoked = pcall(function() remote:InvokeServer("S_Equipment", "Upgrade", upgradeList) end)
-                            if invoked then
-                                upgradePending = false
-                                saveAutomation()
-                                print("[TITAN UI] Sent full Equipment upgrade request; verify result in game.")
-                            else warn("[TITAN UI] Upgrade request failed; toggle Auto Upgrade off/on to try again.") end
-                        end
-                    end
-                    if not app.autoUpgrade then upgradeAttempted = false end
-                    return
-                end
-                lobbySince = nil
-                -- Match server entries, exactly as the supplied counter (not wins).
-                if game:GetService("Workspace"):FindFirstChild("Titans") and game.JobId ~= "" and countedJob ~= game.JobId then
-                    countedJob = game.JobId
-                    app.gameCount = math.min(app.gameCount + 1, 1000000)
-                    saveAutomation()
-                    print("[TITAN UI] Match server count: " .. app.gameCount .. "/" .. app.maxGames)
-                end
-                if now < nextAction then return end
-                local reason = leaveReason()
-                if reason then nextAction = now + 3; requestLobby(reason) end
-            end)
-            if not ok then nextAction = os.clock() + 3 end
-        end
-    end)
-end
-local function loadLibrary()
-local library = {
-    flags = {}
-  }
-  library.Flags = library.flags
 
-  local function parseCompactNumber(text)
-    local cleaned = tostring(text):lower():gsub(",", ""):gsub("%s", "")
-    local digits, suffix = cleaned:match("^(%d+%.?%d*)([kmb]?)$")
-    if not digits then return nil end
-    local number = tonumber(digits) * (({k = 1000, m = 1000000, b = 1000000000})[suffix] or 1)
-    if number ~= number or number >= math.huge then return nil end
-    return number
-  end
-  
-  --// Dependences --//
-  local CoreGui = game:GetService("CoreGui")
-  local TweenService = game:GetService("TweenService")
-  local UserInputService = game:GetService("UserInputService")
-  local RunService = game:GetService("RunService")
-  
-  local ViewportSize = workspace.CurrentCamera.ViewportSize
-  
-  local Mouse = game.Players.LocalPlayer:GetMouse()
-  
-  local Utilities = {}
-
-  --// Compatibility //--
-  local request = syn and syn.request or http and http.request or http_request or request or httprequest
-  local getcustomasset = getcustomasset or getsynasset
-  local isfolder = isfolder or syn_isfolder or is_folder
-  local makefolder = makefolder or make_folder or createfolder or create_folder
-  --//
-
-  local DropIndex = 9999
-  
-  function Utilities:Create(Inst, Properties, Childs)
-  local Instance = Instance.new(Inst)
-  local Properties = Properties or {}
-  local Childs = Childs or {}
-  
-  local BlacklistedProps = {
-      BorderSizePixel = 0,
-      Text = "",
-      BackgroundColor3 = Color3.fromRGB(255, 255, 255)
-  }
-  
-  for blprop, v in pairs(BlacklistedProps) do
-      pcall(function()
-          Instance[blprop] = v
-      end)
-  end
-  
-  for prop, v in pairs(Properties) do
-      Instance[prop] = v
-  end
-  
-  for _, child in pairs(Childs) do
-      child.Parent = Instance
-  end
-  
-  return Instance
-  end
-
-  function Utilities:Round(Number, Increment)
-    Increment = 1 / Increment
-
-    return math.round(Number * Increment) / Increment
-end
-  
-  function Utilities:Tween(Inst, Speed, Properties, Style, Direction)
-  local Instance = Inst or error("#1 argument: instance expected.")
-  local Speed = Speed or .125
-  local Properties = typeof(Properties) == "table" and Properties or error("#3 argument: table expected, got: "..typeof(Properties))
-  local Style = Style or Enum.EasingStyle.Linear
-  local Direction = Direction or Enum.EasingDirection.Out
-  
-  local Tween = TweenService:Create(Instance, TweenInfo.new(Speed, Style, Direction), Properties)
-  Tween:Play()
-  
-  return Tween
-  end
-
-  function Utilities:GetXY(GuiObject)
-	local Max, May = GuiObject.AbsoluteSize.X, GuiObject.AbsoluteSize.Y
-	local Px, Py = math.clamp(Mouse.X - GuiObject.AbsolutePosition.X, 0, Max), math.clamp(Mouse.Y - GuiObject.AbsolutePosition.Y, 0, May)
-	return Px/Max, Py/May
-  end
-
-  function Utilities:GetMouse()
-	return Vector2.new(UserInputService:GetMouseLocation().X + 1, UserInputService:GetMouseLocation().Y - 35)
-  end
-
-  if not isfolder("PPHUD") then
-    makefolder("PPHUD")
-
-    local Arrow = request({Url = "https://raw.githubusercontent.com/Rain-Design/PPHUD/main/Dropdown.png", Method = "GET"})
-    writefile("PPHUD/Arrow.png", Arrow.Body)
-
-    local Resize = request({Url = "https://raw.githubusercontent.com/Rain-Design/PPHUD/main/resize.png", Method = "GET"})
-    writefile("PPHUD/Resize.png", Resize.Body)
-  end
-  --//
-  
-  --// Colors --//
-  local Colors = {
-      Primary = Color3.fromRGB(27, 25, 27),
-      Secondary = Color3.fromRGB(42, 40, 42),
-      Tertiary = Color3.fromRGB(74, 73, 74),
-      Divider = Color3.fromRGB(46, 45, 46),
-      AccentDivider = Color3.fromRGB(54, 54, 54),
-      PrimaryText = Color3.fromRGB(211, 211, 211),
-      SecondaryText = Color3.fromRGB(122, 122, 122),
-      TertiaryText = Color3.fromRGB(158, 158, 158),
-      Hovering = Color3.fromRGB(56, 53, 56),
-      Accent = Color3.fromRGB(100, 190, 31),
-      DarkerAccent = Color3.fromRGB(87, 167, 26),
-      AccentText = Color3.fromRGB(235, 235, 235)
-  }
-  --//
-  
-  function library:Window(WindowArgs)
-  WindowArgs.Text = WindowArgs.Text or "Window"
-  
-  local WindowTable = {}
-  WindowTable.__index = WindowTable
-  
-  self.Tabs = 0
-  self.Hovering = false
-  
-  local SelectedTab = nil
-  
-  local Window = Utilities:Create("ScreenGui", {
-      Name = "PPHUD",
-      ZIndexBehavior = Enum.ZIndexBehavior.Global
-  }, {
-      Utilities:Create("Frame", {
-          Name = "Main",
-          Size = UDim2.new(0, 600, 0, 400),
-          BackgroundColor3 = Color3.fromRGB(255, 255, 255), -- Colors.Primary
-          ClipsDescendants = true,
-          Position = UDim2.fromScale(0.5, 0.5),
-          AnchorPoint = Vector2.new(0.5, 0.5),
-          Active = true
-      }, {
-          Utilities:Create("UIGradient", {
-              Color = ColorSequence.new({
-                  ColorSequenceKeypoint.new(0, Color3.fromRGB(27, 25, 27)),
-                  ColorSequenceKeypoint.new(1, Color3.fromRGB(12, 10, 12)),
-              }),
-              Offset = Vector2.new(0, 0.65),
-              Rotation = 90
-          }),
-          Utilities:Create("Frame", {
-              Name = "Containers",
-              Size = UDim2.new(1, 0, 1, -50),
-              BackgroundTransparency = 1,
-              Position = UDim2.new(0, 0, 0, 26)
-          }),
-          Utilities:Create("Frame", {
-              Name = "Bottom",
-              Size = UDim2.new(1, 0, 0, 24),
-              AnchorPoint = Vector2.new(.5, 1),
-              Position = UDim2.new(.5, 0, 1, 0),
-              BackgroundColor3 = Colors.Secondary,
-              ZIndex = DropIndex + 5
-          }, {
-              Utilities:Create("Frame", {
-                  Name = "Divider",
-                  Size = UDim2.new(1, 0, 0, 1),
-                  AnchorPoint = Vector2.new(.5, 0),
-                  BackgroundColor3 = Colors.Divider,
-                  Position = UDim2.new(.5, 0, 0, 0),
-                  ZIndex = DropIndex + 5
-              }),
-              Utilities:Create("ImageLabel", {
-                Name = "ResizeIcon",
-                Size = UDim2.new(0, 10, 0, 10),
-                BackgroundTransparency = 1,
-                Image = getcustomasset("PPHUD/Resize.png"),
-                AnchorPoint = Vector2.new(1, 1),
-                Position = UDim2.new(1, 0, 1, 0),
-                ZIndex = DropIndex + 5
-              }, {
-                Utilities:Create("TextButton", {
-                    Name = "ResizeButton",
-                    Size = UDim2.new(0, 10, 0, 10),
-                    BackgroundTransparency = 1,
-                    ZIndex = DropIndex + 5
-                })
-              }),
-              Utilities:Create("TextLabel", {
-                  Name = "BottomText",
-                  Text = WindowArgs.Text,
-                  Size = UDim2.new(1, -10, 0, 24),
-                  BackgroundTransparency = 1,
-                  Position = UDim2.new(0, 8, 0, 0),
-                  RichText = true,
-                  TextXAlignment = Enum.TextXAlignment.Left,
-                  TextSize = 13,
-                  Font = Enum.Font.SourceSansBold,
-                  TextColor3 = Colors.PrimaryText,
-                  ZIndex = DropIndex + 5
-              }, {
-                Utilities:Create("TextButton", {
-                    Name = "CloseConsole",
-                    BackgroundTransparency = 1,
-                    Text = "",
-                    Size = UDim2.new(1, -10, 0, 24),
-                    ZIndex = 11001
-                })
-              })
-          }),
-          Utilities:Create("Frame", {
-              Name = "Topbar",
-              AnchorPoint = Vector2.new(.5, 0),
-              Position = UDim2.new(.5, 0, 0, 0),
-              BackgroundColor3 = Colors.Secondary,
-              Size = UDim2.new(1, 0, 0, 26)
-          }, {
-              Utilities:Create("Frame", {
-                  Name = "Divider",
-                  Size = UDim2.new(1, 0, 0, 1),
-                  BackgroundColor3 = Colors.Divider,
-                  AnchorPoint = Vector2.new(0.5, 1),
-                  ZIndex = 2,
-                  Position = UDim2.new(.5, 0, 1, 0)
-              }),
-              Utilities:Create("Frame", {
-                  Name = "TabContainer",
-                  Size = UDim2.new(1, 0, 0, 26),
-                  BackgroundTransparency = 1,
-                  ClipsDescendants = true
-              }, {
-                  Utilities:Create("UIListLayout", {
-                      FillDirection = Enum.FillDirection.Horizontal
-                  })
-              })
-          })
-      })
-  })
-
-  UserInputService.InputBegan:Connect(function(Input, GameProcessed)
-    if Input.KeyCode == Enum.KeyCode.LeftAlt and not GameProcessed then
-        Window.Main.Visible = not Window.Main.Visible
-    end
-  end)
-
-  local Console = Utilities:Create("Frame", {
-    Name = "Console",
-    Size = UDim2.new(0, 500, 0, 300),
-    Parent = Window.Main,
-    AnchorPoint = Vector2.new(.5, .5),
-    Visible = false,
-    ZIndex = 11000,
-    Position = UDim2.fromScale(.5, .5),
-    BackgroundColor3 = Colors.Primary
-  }, {
-    Utilities:Create("UIStroke", {
-        Color = Colors.Divider
-    }),
-    Utilities:Create("ScrollingFrame", {
-        Name = "ConsoleContainer",
-        Size = UDim2.new(0, 500, 0, 276),
-        CanvasSize = UDim2.new(0, 0, 0, 0),
-        AutomaticCanvasSize = Enum.AutomaticSize.Y,
-        Position = UDim2.new(0, 0, 0, 24),
-        ScrollBarThickness = 0,
-        BackgroundTransparency = 1,
-        ZIndex = 11001
-    }, {
-        Utilities:Create("UIListLayout")
-    }),
-    Utilities:Create("Frame", {
-        Name = "ConsoleTopbar", 
-        AnchorPoint = Vector2.new(.5, 0),
-        Position = UDim2.new(.5, 0, 0, 0),
-        BackgroundColor3 = Colors.Secondary,
-        ZIndex = 11001,
-        Size = UDim2.new(1, 0, 0, 24)
-    }, {
-        Utilities:Create("TextLabel", {
-            Name = "ConsoleText",
-            Text = "Console",
-            Size = UDim2.new(1, -10, 0, 24),
-            BackgroundTransparency = 1,
-            Position = UDim2.new(0, 8, 0, 0),
-            RichText = true,
-            TextXAlignment = Enum.TextXAlignment.Left,
-            TextSize = 13,
-            Font = Enum.Font.SourceSansBold,
-            TextColor3 = Colors.PrimaryText,
-            ZIndex = 11001
-        })
-    })
-  })
-
-  local consoleContainer = Console.ConsoleContainer
-
-  local scrollSize
-  consoleContainer.UIListLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
-    scrollSize = consoleContainer.UIListLayout.AbsoluteContentSize.Y
-
-    consoleContainer.CanvasPosition = Vector2.new(0, scrollSize)
-  end)
-
-  local bottomText = Window.Main.Bottom.BottomText
-
-  bottomText.MouseEnter:Connect(function()
-    Utilities:Tween(bottomText, .125, {TextColor3 = Colors.Accent})
-  end)
-
-  bottomText.MouseLeave:Connect(function()
-    Utilities:Tween(bottomText, .125, {TextColor3 = Colors.PrimaryText})
-  end)
-
-  bottomText.CloseConsole.MouseButton1Click:Connect(function()
-    WindowTable:ToggleConsole()
-  end)
-
-  function WindowTable:ToggleConsole()
-    Console.Visible = not Console.Visible
-  end
-
-  local coloredMessage = true
-  function WindowTable:Message(consoleArgs)
-    consoleArgs.Text = consoleArgs.Text or "Message"
-    consoleArgs.Color = consoleArgs.Color or Colors.PrimaryText
-
-    coloredMessage = not coloredMessage
-
-    local currentDate = os.date("%X")
-
-    local finalMessage = string.format("[%s] %s", currentDate, consoleArgs.Text)
-
-    local Message = Utilities:Create("Frame", {
-        Name = "ConsoleMessage",
-        BackgroundColor3 = Colors.Divider,
-        BackgroundTransparency = coloredMessage and 0 or 1,
-        Size = UDim2.new(0, 500, 0, 23),
-        ZIndex = 11002,
-        Parent = Console.ConsoleContainer
-    }, {
-        Utilities:Create("TextLabel", {
-            Name = "MessageText",
-            Text = finalMessage,
-            Size = UDim2.new(1, 0, 0, 23),
-            BackgroundTransparency = 1,
-            Position = UDim2.new(0, 3, 0, 0),
-            RichText = true,
-            TextXAlignment = Enum.TextXAlignment.Left,
-            TextSize = 13,
-            Font = Enum.Font.SourceSansBold,
-            TextColor3 = consoleArgs.Color,
-            ZIndex = 11002
-        })
-    })
-  end
-
-  -- Executor compatibility: syn may not exist at all.
-  if type(syn) == "table" and type(syn.protect_gui) == "function" then
-    pcall(syn.protect_gui, Window)
-  end
-  local guiParent = CoreGui
-  if type(gethui) == "function" then
-    local ok, hiddenGui = pcall(gethui)
-    if ok and hiddenGui then guiParent = hiddenGui end
-  end
-  local parented = pcall(function() Window.Parent = guiParent end)
-  if not parented then
-    Window.Parent = game:GetService("Players").LocalPlayer:WaitForChild("PlayerGui")
-  end
-
-  local ResizeButton = Window.Main.Bottom.ResizeIcon.ResizeButton
-  Window.ResetOnSpawn = false
-  local mobileScale = Instance.new("UIScale")
-  mobileScale.Parent = Window.Main
-  local function fitScreen(center)
-      local camera = workspace.CurrentCamera
-      if not camera then return end
-      local viewport = camera.ViewportSize
-      local size = Window.Main.Size
-      mobileScale.Scale = math.min(1, math.max(1, viewport.X - 24) / math.max(size.X.Offset, 1),
-          math.max(1, viewport.Y - 70) / math.max(size.Y.Offset, 1))
-      if center then Window.Main.Position = UDim2.fromScale(0.5, 0.5) end
-  end
-  fitScreen(true)
-  Window.Main:GetPropertyChangedSignal("Size"):Connect(function() fitScreen(false) end)
-  if workspace.CurrentCamera then
-      workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(function() fitScreen(true) end)
-  end
-  local restore = Utilities:Create("TextButton", {
-      Name = "RestoreUI", Parent = Window, Text = "UI", TextSize = 16,
-      Font = Enum.Font.SourceSansBold, TextColor3 = Colors.PrimaryText,
-      BackgroundColor3 = Colors.Secondary, Position = UDim2.fromOffset(12, 65),
-      Size = UDim2.fromOffset(44, 36), ZIndex = 20000
-  })
-  restore.Activated:Connect(function()
-      Window.Main.Visible = true
-      fitScreen(true)
-  end)
-  local TabContainer = Window.Main.Topbar.TabContainer
-  local Containers = Window.Main.Containers
-
-  local SizeX = Instance.new("NumberValue", Window.Main)
-  SizeX.Name = "X"
-
-  local SizeY = Instance.new("NumberValue", Window.Main)
-  SizeY.Name = "Y"
-
-  local function ResizeTabs()
-    local TabSize = 1 / self.Tabs
-    
-    task.spawn(function()
-      for _, v in pairs(TabContainer:GetChildren()) do
-          if v.ClassName == "Frame" then
-              v.Size = UDim2.new(TabSize, 0, 0, 26)
-          end
-      end
-    end)
-  end
-
-  local function Resize()
-    local MouseLocation = Utilities:GetMouse()
-    local X = math.clamp(MouseLocation.X - Window.Main.AbsolutePosition.X, 300, 1300)
-    local Y = math.clamp(MouseLocation.Y - Window.Main.AbsolutePosition.Y, 165, 730)
-    
-    SizeX.Value = X
-    SizeY.Value = Y
-
-    Utilities:Tween(Window.Main, .05, {Size = UDim2.new(0, X, 0, Y)})
-
-    ResizeTabs()
-  end
-
-  ResizeButton.MouseButton1Down:Connect(function()
-  local ResizeMove, ResizeKill
-  
-  Utilities:Tween(Window.Main.Bottom.ResizeIcon, .125, {ImageColor3 = Colors.Accent})
-
-  ResizeMove = Mouse.Move:Connect(function()
-    Resize()
-  end)
-
-  ResizeKill = UserInputService.InputEnded:Connect(function(UserInput)
-    if UserInput.UserInputType == Enum.UserInputType.MouseButton1 then
-        ResizeMove:Disconnect()
-        ResizeKill:Disconnect()
-
-        Utilities:Tween(Window.Main.Bottom.ResizeIcon, .125, {ImageColor3 = Color3.fromRGB(255, 255, 255)})
-    end
-  end)
-  
-    --TweenService:Create(Window.Mai, TweenInfo.new(0.09, Enum.EasingStyle.Linear, Enum.EasingDirection.Out), {Size = UDim2.new(Scale,0,0,14)}):Play()
-  end)
-
-  TabContainer.ChildAdded:Connect(function()
-      self.Tabs = self.Tabs + 1
-  
-      ResizeTabs()
-  end)
-
-  local dragging = false
-  local dragInput, mousePos, framePos
-
-  local dragBar = Utilities:Create("TextButton", {
-      Name = "TouchDragBar", Parent = Window.Main.Bottom, Text = "",
-      Size = UDim2.new(1, -28, 1, 0), BackgroundTransparency = 1, ZIndex = 12000
-  })
-  dragBar.InputBegan:Connect(function(input)
-      if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-          dragging = true
-          dragInput = input
-          mousePos = input.Position
-          framePos = Window.Main.Position
-              
-          input.Changed:Connect(function()
-              if input.UserInputState == Enum.UserInputState.End then
-                  dragging = false
-              end
-          end)
-      end
-  end)
-
-  dragBar.InputChanged:Connect(function(input)
-      if input.UserInputType == Enum.UserInputType.MouseMovement then
-          dragInput = input
-      end
-  end)
-
-  UserInputService.InputChanged:Connect(function(input)
-      if dragging and (input == dragInput or input.UserInputType == Enum.UserInputType.MouseMovement) then
-          local delta = input.Position - mousePos
-          local viewport = workspace.CurrentCamera.ViewportSize
-          local centerX = framePos.X.Scale * viewport.X + framePos.X.Offset + delta.X
-          local centerY = framePos.Y.Scale * viewport.Y + framePos.Y.Offset + delta.Y
-          local half = Window.Main.AbsoluteSize / 2
-          Window.Main.Position = UDim2.fromOffset(
-              math.clamp(centerX, half.X, math.max(half.X, viewport.X - half.X)),
-              math.clamp(centerY, half.Y + 30, math.max(half.Y + 30, viewport.Y - half.Y)))
-      end
-  end)
-  
-  function WindowTable:Exit()
-      Window:Destroy()
-  end
-  
-  function WindowTable:Toggle()
-      Window.Main.Visible = not Window.Main.Visible
-  end
-  
-  function WindowTable:Tab(TabArgs)
-  TabArgs.Text = TabArgs.Text or "Tab"
-  
-  local TabTable = {}
-  
-  local Tab = Utilities:Create("Frame", {
-      Name = "Tab",
-      Parent = TabContainer,
-      Size = UDim2.new(0, 200, 0, 26),
-      BackgroundTransparency = 1,
-  }, {
-      Utilities:Create("Frame", {
-          Name = "Divider",
-          AnchorPoint = Vector2.new(.5, 1),
-          Position = UDim2.new(.5, 0, 1, 0),
-          Size = UDim2.new(1, 0, 0, 1),
-          ZIndex = 3,
-          BackgroundColor3 = Colors.Divider
-      }),
-      Utilities:Create("TextLabel", {
-          Name = "TabText",
-          BackgroundTransparency = 1,
-          Size = UDim2.new(1, 0, 1, 0),
-          Text = TabArgs.Text,
-          RichText = true,
-          Font = Enum.Font.SourceSansBold,
-          TextColor3 = Colors.SecondaryText,
-          TextSize = 14,
-          ZIndex = 2
-      }),
-      Utilities:Create("TextButton", {
-          Name = "TabButton",
-          Size = UDim2.new(1, 0, 1, 0),
-          BackgroundTransparency = 1
-      })
-  })
-
-  ResizeTabs()
-
-  local ContainerHolder = Utilities:Create("Frame", {
-    Name = "ContainerHolder",
-    Size = UDim2.new(1, 0, 1, 0),
-    Parent = Containers,
-    BackgroundTransparency = 1
-  }, {
-    Utilities:Create("UIListLayout", {
-        FillDirection = Enum.FillDirection.Horizontal
-    })
-  })
-  
-  local Left = Utilities:Create("ScrollingFrame", {
-      Name = "Left",
-      BackgroundTransparency = 1,
-      Visible = false,
-      BackgroundColor3 = Color3.fromRGB(167, 54, 54),
-      CanvasSize = UDim2.new(0, 0, 0, 0),
-      AutomaticCanvasSize = Enum.AutomaticSize.Y,
-      ClipsDescendants = false,
-      ScrollBarThickness = 0,
-      Parent = ContainerHolder,
-      Size = UDim2.new(.5, 0, 0, 350)
-      }, {
-          Utilities:Create("UIListLayout"),
-          Utilities:Create("UIPadding", {
-              PaddingLeft = UDim.new(0, 8)
-          })
-  })
-  
-  local Right = Utilities:Create("ScrollingFrame", {
-      Name = "Right",
-      BackgroundTransparency = 1,
-      Visible = false,
-      BackgroundColor3 = Color3.fromRGB(45, 175, 62),
-      CanvasSize = UDim2.new(0, 0, 0, 0),
-      AutomaticCanvasSize = Enum.AutomaticSize.Y,
-      ClipsDescendants = false,
-      ScrollBarThickness = 0,
-      Parent = ContainerHolder,
-      Size = UDim2.new(.5, 0, 0, 350),
-      Position = UDim2.new(0, 300, 0, 0)
-      }, {
-          Utilities:Create("UIListLayout"),
-          Utilities:Create("UIPadding", {
-              PaddingLeft = UDim.new(0, 6)
-          })
-  })
-  
-  Tab.MouseEnter:Connect(function()
-      if SelectedTab == nil or SelectedTab ~= Tab then
-          Utilities:Tween(Tab.Divider, .125, {BackgroundColor3 = Colors.Tertiary})
-          Utilities:Tween(Tab.TabText, .125, {TextColor3 = Colors.PrimaryText})
-      end
-  end)
-  
-  Tab.MouseLeave:Connect(function()
-      if SelectedTab == nil or Tab ~= SelectedTab then
-          Utilities:Tween(Tab.Divider, .125, {BackgroundColor3 = Colors.Divider})
-          Utilities:Tween(Tab.TabText, .125, {TextColor3 = Colors.SecondaryText})
-      end
-  end)
-  
-  function TabTable:Select()
-  SelectedTab = Tab
-  
-  task.spawn(function()
-      for _, v in pairs(Containers:GetChildren()) do
-        if v.Name == "ContainerHolder" then
-            if v.Left ~= Left then
-                v.Left.Visible = false
-                v.Right.Visible = false
-            end
-        end
-      end
-      
-      for _, v in pairs(TabContainer:GetChildren()) do
-          if v.ClassName == "Frame" and v ~= Tab then
-              Utilities:Tween(v.Divider, .125, {BackgroundColor3 = Colors.Divider})
-              Utilities:Tween(v.TabText, .125, {TextColor3 = Colors.SecondaryText})
-          end
-      end
-  end)
-  
-  Left.Visible = true
-  Right.Visible = true
-  Utilities:Tween(Tab.Divider, .125, {BackgroundColor3 = Colors.DarkerAccent})
-  Utilities:Tween(Tab.TabText, .125, {TextColor3 = Colors.AccentText})
-  end
-  
-  Tab.TabButton.MouseButton1Click:Connect(function()
-      TabTable:Select()
-  end)
-  
-  function TabTable:Section(SectionArgs)
-  SectionArgs.Text = SectionArgs.Text or "Section"
-  SectionArgs.Side = SectionArgs.Side or "Left"
-
-  local SectionTable = {}
-  
-  local Section = Utilities:Create("Frame", {
-      Name = "Section",
-      Parent = SectionArgs.Side == "Left" and Left or Right,
-      BackgroundColor3 = Color3.fromRGB(167, 54, 54),
-      BackgroundTransparency = 1,
-      Size = UDim2.new(0, 286, 0, 36) -- +64
-  }, {
-      Utilities:Create("TextLabel", {
-          Name = "SectionText",
-          Size = UDim2.new(0, 286, 0, 26),
-          Text = SectionArgs.Text,
-          TextXAlignment = Enum.TextXAlignment.Left,
-          TextSize = 14,
-          BackgroundTransparency = 1,
-          TextColor3 = Colors.PrimaryText,
-          RichText = true,
-          Font = Enum.Font.SourceSansBold,
-          ZIndex = 2
-      }),
-      Utilities:Create("Frame", {
-          Name = "Divider",
-          Position = UDim2.new(0, 0, 0, 28),
-          Size = UDim2.new(0, 286, 0, 1),
-          BackgroundColor3 = Colors.Divider
-      }),
-      Utilities:Create("Frame", {
-        Name = "Container",
-        Size = UDim2.new(0, 286, 0, 0),
-        BackgroundTransparency = 1,
-        Position = UDim2.new(0, 0, 0, 38)
-      }, {
-        Utilities:Create("UIListLayout", {
-            SortOrder = Enum.SortOrder.LayoutOrder
-        })
-      })
-  })
-
-  local SectionY = 36
-
-  SizeX:GetPropertyChangedSignal("Value"):Connect(function()
-    local Size = SizeX.Value / 2 - 14
-    Section.Size = UDim2.new(0, Size, 0, SectionY)
-    Section.Divider.Size = UDim2.new(0, Size, 0, 1)
-  end)
-
-  local SectionContainer = Section.Container
-
-  local function updateSectionHeight()
-    SectionY = 36
-    for _, child in ipairs(SectionContainer:GetChildren()) do
-      if child:IsA("GuiObject") then SectionY = SectionY + child.Size.Y.Offset end
-    end
-
-    Section.Size = UDim2.new(0, 286, 0, SectionY)
-    SectionContainer.Size = UDim2.new(0, 286, 0, SectionY)
-  end
-  SectionContainer.ChildAdded:Connect(function(child)
-    updateSectionHeight()
-    if child:IsA("GuiObject") then child:GetPropertyChangedSignal("Size"):Connect(updateSectionHeight) end
-  end)
-
-  function SectionTable:NumberInput(Info)
-    local minimum, maximum = Info.Minimum or 1, Info.Maximum or 1000000000
-    local value = math.clamp(math.floor(Info.Default or minimum), minimum, maximum)
-    local row = Utilities:Create("Frame", {
-      Parent = SectionContainer, Size = UDim2.new(0, 286, 0, 21), BackgroundTransparency = 1
-    })
-    Utilities:Create("TextLabel", {
-      Parent = row, Text = Info.Text or "Number", Size = UDim2.new(.5, 0, 1, 0),
-      TextSize = 13, Font = Enum.Font.SourceSansBold, TextColor3 = Colors.PrimaryText,
-      TextXAlignment = Enum.TextXAlignment.Left, BackgroundTransparency = 1
-    })
-    local box = Utilities:Create("TextBox", {
-      Parent = row, Text = tostring(value), Position = UDim2.new(.5, 0, 0, 0),
-      Size = UDim2.new(.5, -5, 0, 19), TextSize = 13, Font = Enum.Font.SourceSansBold,
-      TextColor3 = Colors.PrimaryText, BackgroundColor3 = Colors.Secondary,
-      ClearTextOnFocus = false
-    })
-    box.FocusLost:Connect(function()
-      local number = parseCompactNumber(box.Text)
-      if number and number == number and number > -math.huge and number < math.huge then
-        value = math.clamp(math.floor(number), minimum, maximum)
-        if Info.Callback then Info.Callback(value) end
-      end
-      box.Text = tostring(value)
-    end)
-    return {Get = function() return value end}
-  end
-
-  function SectionTable:Check(CheckArgs)
-  CheckArgs.Text = CheckArgs.Text or "Check"
-  CheckArgs.Flag = CheckArgs.Flag or nil
-  CheckArgs.Default = CheckArgs.Default or false
-  CheckArgs.Callback = CheckArgs.Callback or function() end
-
-  local State = false
-  
-  local CheckTable = {}
-
-  local Check = Utilities:Create("Frame", {
-    Name = "Check",
-    Parent = SectionContainer,
-    Size = UDim2.new(0, 286, 0, 21),
-    BackgroundTransparency = 1,
-  }, {
-    Utilities:Create("TextButton", {
-        Name = "CheckButton",
-        Size = UDim2.new(0, 14, 0, 14),
-        BackgroundTransparency = 1
-    }),
-    Utilities:Create("Frame", {
-        Name = "CheckFrame",
-        Size = UDim2.new(0, 14, 0, 14),
-        BackgroundTransparency = 1
-    }, {
-        Utilities:Create("TextLabel", {
-            Name = "CheckText",
-            Text = CheckArgs.Text,
-            TextSize = 13,
-            RichText = true,
-            Font = Enum.Font.SourceSansBold,
-            Size = UDim2.new(0, 14, 0, 14),
-            TextXAlignment = Enum.TextXAlignment.Left,
-            Position = UDim2.new(0, 20, 0, 0),
-            TextColor3 = Colors.PrimaryText,
-            BackgroundTransparency = 1
-        }),
-        Utilities:Create("Frame", {
-            Name = "CheckInner",
-            AnchorPoint = Vector2.new(.5, .5),
-            Position = UDim2.new(.5, 0, .5, 0),
-            Size = UDim2.new(0, 12, 0, 12),
-            BackgroundColor3 = Colors.Secondary
-        }),
-        Utilities:Create("UIStroke", {
-            Color = Colors.Divider
-        })
-    })
-  })
-
-  local CheckButton = Check.CheckButton
-
-  local TextBounds = Check.CheckFrame.CheckText.TextBounds
-  local ButtonSize = TextBounds.X ~= "" and TextBounds.X + 20 or 14
-
-  CheckButton.MouseEnter:Connect(function()
-    if not State then
-        Utilities:Tween(Check.CheckFrame.UIStroke, .125, {Color = Colors.Tertiary})
-        Utilities:Tween(Check.CheckFrame.CheckInner, .125, {BackgroundColor3 = Colors.Hovering})
-    end
-  end)
-
-  CheckButton.MouseLeave:Connect(function()
-    if not State then
-        Utilities:Tween(Check.CheckFrame.UIStroke, .125, {Color = Colors.Divider})
-        Utilities:Tween(Check.CheckFrame.CheckInner, .125, {BackgroundColor3 = Colors.Secondary})
-    end
-  end)
-
-  CheckButton.Size = UDim2.new(0, ButtonSize, 0, 14)
-
-  function CheckTable:Set(bool)
-    task.spawn(CheckArgs.Callback, bool)
-    State = bool
-    if CheckArgs.Flag ~= nil then
-        library.Flags[CheckArgs.Flag] = bool
-    end
-    
-    if State then
-        Utilities:Tween(Check.CheckFrame.UIStroke, .125, {Color = Colors.Accent})
-        Utilities:Tween(Check.CheckFrame.CheckInner, .125, {BackgroundColor3 = Colors.Accent})
-    else
-        Utilities:Tween(Check.CheckFrame.UIStroke, .125, {Color = Colors.Divider})
-        Utilities:Tween(Check.CheckFrame.CheckInner, .125, {BackgroundColor3 = Colors.Secondary})
-    end
-  end
-
-  CheckButton.MouseButton1Click:Connect(function()
-    State = not State
-
-    CheckTable:Set(State)
-  end)
-
-  return CheckTable
-  end
-
-  function SectionTable:Button(Info)
-  Info.Text = Info.Text or "Button"
-  Info.Callback = Info.Callback or function() end
-
-  local Button = Utilities:Create("Frame", {
-    Name = "Button",
-    Parent = SectionContainer,
-    Size = UDim2.new(0, 286, 0, 21),
-    BackgroundTransparency = 1
-  }, {
-    Utilities:Create("Frame", {
-        Name = "ButtonFrame",
-        BackgroundColor3 = Colors.Secondary,
-        Size = UDim2.new(0, 14, 0, 14)
-    }, {
-        Utilities:Create("UIStroke", {
-            Color = Colors.Divider
-        }),
-        Utilities:Create("TextLabel", {
-            Name = "ButtonText",
-            Size = UDim2.new(1, 0, 1, 0),
-            Text = Info.Text,
-            RichText = true,
-            Font = Enum.Font.SourceSansBold,
-            BackgroundTransparency = 1,
-            TextSize = 13,
-            TextColor3 = Colors.PrimaryText
-        }),
-        Utilities:Create("TextButton", {
-            Name = "ButtonButton",
-            Size = UDim2.new(1, 0, 1, 0),
-            BackgroundTransparency = 1
-        })
-    })
-  })
-
-  local Hovering = false
-
-  Button.ButtonFrame.MouseEnter:Connect(function()
-    Hovering = true
-    Utilities:Tween(Button.ButtonFrame, .125, {BackgroundColor3 = Colors.Hovering})
-    Utilities:Tween(Button.ButtonFrame.UIStroke, .125, {Color = Colors.AccentDivider})
-  end)
-
-  Button.ButtonFrame.MouseLeave:Connect(function()
-    Hovering = false
-    Utilities:Tween(Button.ButtonFrame, .125, {BackgroundColor3 = Colors.Secondary})
-    Utilities:Tween(Button.ButtonFrame.UIStroke, .125, {Color = Colors.Divider})
-  end)
-
-  local TextX = math.clamp(Button.ButtonFrame.ButtonText.TextBounds.X, 15, 1000)
-
-  Button.ButtonFrame.Size = UDim2.new(0, TextX + 10, 0, 14)
-
-  Button.ButtonFrame.ButtonButton.MouseButton1Down:Connect(function()
-    Utilities:Tween(Button.ButtonFrame.UIStroke, .1, {Color = Colors.Accent})
-    Utilities:Tween(Button.ButtonFrame.ButtonText, .1, {TextColor3 = Colors.AccentText})
-  end)
-
-  Button.ButtonFrame.ButtonButton.MouseButton1Up:Connect(function()
-    Utilities:Tween(Button.ButtonFrame.ButtonText, .1, {TextColor3 = Colors.PrimaryText})
-    if Hovering then
-        Utilities:Tween(Button.ButtonFrame.UIStroke, .125, {Color = Colors.AccentDivider})
-        else
-        Utilities:Tween(Button.ButtonFrame.UIStroke, .125, {Color = Colors.Divider})
-    end
-  end)
-
-  Button.ButtonFrame.ButtonButton.MouseButton1Click:Connect(function()
-    task.spawn(Info.Callback)
-  end)
-  
-  end
-
-  function SectionTable:Slider(Info)
-  Info.Text = Info.Text or "Slider"
-  Info.Flag = Info.Flag or nil
-  Info.Default = Info.Default or 10
-  Info.Minimum = Info.Minimum or 5
-  Info.Maximum = Info.Maximum or 20
-  Info.Incrementation = Info.Incrementation or 1
-  Info.Postfix = Info.Postfix or ""
-  Info.Callback = Info.Callback or function() end
-
-  if Info.Minimum > Info.Maximum then
-    local ValueBefore = Info.Minimum
-    Info.Minimum, Info.Maximum = Info.Maximum, ValueBefore
-    end
-
-    local DefaultValue = math.clamp(Info.Default, Info.Minimum, Info.Maximum)
-    local Rounded = Utilities:Round(DefaultValue, Info.Incrementation)
-
-    local DefaultScale = (Rounded - Info.Minimum) / (Info.Maximum - Info.Minimum)
-
-    local StepFormat = "%d"
-    local Step = Info.Incrementation
-
-    for i = 1, 10 do
-        if Step == 1 then break end
-        
-        StepFormat = '%.' .. i .. 'f'
-        if StepFormat:format(Step) == tostring(Step) then
-            break
-        end
-    end
-
-  local Slider = Utilities:Create("Frame", {
-    Name = "Slider",
-    Parent = SectionContainer,
-    Size = UDim2.new(0, 286, 0, 21),
-    BackgroundTransparency = 1
-  }, {
-    Utilities:Create("Frame", {
-        Name = "SliderOuter",
-        BackgroundColor3 = Colors.Secondary,
-        Size = UDim2.new(.6, 3, 0, 14)
-    }, {
-        Utilities:Create("UIStroke", {
-            Color = Colors.AccentDivider
-        }),
-        Utilities:Create("Frame", {
-            Name = "SliderInner",
-            BackgroundColor3 = Colors.DarkerAccent,
-            Size = UDim2.fromScale(DefaultScale, 1)
-        }),
-        Utilities:Create("TextLabel", {
-            Name = "SliderValueText",
-            Text = StepFormat:format(Rounded)..Info.Postfix,
-            TextSize = 13,
-            Font = Enum.Font.SourceSansBold,
-            RichText = true,
-            Size = UDim2.new(1, 0, 0, 14),
-            TextColor3 = Color3.fromRGB(255, 255, 255),
-            BackgroundTransparency = 1
-        }),
-        Utilities:Create("TextButton", {
-            Name = "SliderButton",
-            Size = UDim2.new(1, 0, 1, 0),
-            BackgroundTransparency = 1,
-        }),
-        Utilities:Create("TextLabel", {
-            Name = "SliderText",
-            Text = Info.Text,
-            TextSize = 13,
-            Font = Enum.Font.SourceSansBold,
-            RichText = true,
-            Size = UDim2.new(1, 0, 0, 14),
-            TextXAlignment = Enum.TextXAlignment.Left,
-            Position = UDim2.new(1, 6, 0, 0),
-            TextColor3 = Colors.PrimaryText,
-            BackgroundTransparency = 1
-        })
-    })
-  })
-
-  SizeX:GetPropertyChangedSignal("Value"):Connect(function()
-    local Size = SizeX.Value / 2 - 14
-    Slider.Size = UDim2.new(0, Size, 0, 21)
-  end)
-
-  Slider.SliderOuter.MouseEnter:Connect(function()
-    Utilities:Tween(Slider.SliderOuter.UIStroke, .125, {Color = Colors.Tertiary})
-    Utilities:Tween(Slider.SliderOuter, .125, {BackgroundColor3 = Colors.Hovering})
-  end)
-
-  Slider.SliderOuter.MouseLeave:Connect(function()
-    Utilities:Tween(Slider.SliderOuter.UIStroke, .125, {Color = Colors.AccentDivider})
-    Utilities:Tween(Slider.SliderOuter, .125, {BackgroundColor3 = Colors.Secondary})
-    Utilities:Tween(Slider.SliderOuter.SliderInner, .125, {BackgroundColor3 = Colors.DarkerAccent})
-  end)
-
-  Slider.SliderOuter.SliderButton.MouseButton1Down:Connect(function()
-    Utilities:Tween(Slider.SliderOuter.SliderInner, .125, {BackgroundColor3 = Colors.Accent})
-  end)
-
-  Slider.SliderOuter.SliderButton.MouseButton1Up:Connect(function()
-    Utilities:Tween(Slider.SliderOuter.SliderInner, .125, {BackgroundColor3 = Colors.DarkerAccent})
-  end)
-
-  local MinSize = 0
-    local MaxSize = 1
-
-    local SizeFromScale = (MinSize +  (MaxSize - MinSize)) * DefaultScale
-    SizeFromScale = SizeFromScale - (SizeFromScale % 2)
-
-    Slider.SliderOuter.SliderButton.MouseButton1Down:Connect(function()
-        local MouseMove, MouseKill
-        MouseMove = Mouse.Move:Connect(function()
-            local Px = Utilities:GetXY(Slider.SliderOuter)
-            local ScaledValue = Px * (Info.Maximum - Info.Minimum) + Info.Minimum
-            local RoundedValue = Utilities:Round(ScaledValue, Info.Incrementation)
-            local FinalValue = math.clamp(RoundedValue, Info.Minimum, Info.Maximum)
-            local SizeX = (FinalValue - Info.Minimum) / (Info.Maximum - Info.Minimum)
-            Utilities:Tween(Slider.SliderOuter.SliderInner, 0.09, {Size = UDim2.new(SizeX,0,1,0)})
-            if Info.Flag then
-                library.Flags[Info.Flag] = FinalValue
-            end
-            Slider.SliderOuter.SliderValueText.Text = StepFormat:format(FinalValue)..Info.Postfix
-            task.spawn(Info.Callback, FinalValue)
-        end)
-        MouseKill = UserInputService.InputEnded:Connect(function(UserInput)
-            if UserInput.UserInputType == Enum.UserInputType.MouseButton1 then
-                MouseMove:Disconnect()
-                MouseKill:Disconnect()
-            end
-        end)
-    end)
-  end
-
-  function SectionTable:Label(Info)
-    Info.Text = Info.Text or "Label"
-    Info.Color = Info.Color or Colors.PrimaryText
-
-    local LabelTable = {}
-
-    local Label = Utilities:Create("Frame", {
-        Name = "Label",
-        Parent = SectionContainer,
-        Size = UDim2.new(0, 286, 0, Info.Height or 21),
-        BackgroundTransparency = 1
-    }, {
-        Utilities:Create("TextLabel", {
-            Name = "LabelText",
-            Text = Info.Text,
-            TextColor3 = Info.Color,
-            RichText = true,
-            BackgroundTransparency = 1,
-            Size = UDim2.new(1, -8, 0, (Info.Height or 21) - 4),
-            TextWrapped = Info.Wrapped == true,
-            TextYAlignment = Enum.TextYAlignment.Top,
-            TextXAlignment = Enum.TextXAlignment.Left,
-            TextSize = 13,
-            Font = Enum.Font.SourceSansBold
-        })
-    })
-
-    function LabelTable:Set(str, color)
-        str = str or Label.LabelText.Text
-        color = color or Info.Color
-
-        Label.LabelText.Text = str
-        Label.LabelText.TextColor3 = color
-    end
-
-    return LabelTable
-  end
-
-  function SectionTable:Dropdown(Info)
-    Info.Text = Info.Text or "Dropdown"
-    Info.Flag = Info.Flag or nil
-    Info.Multi = Info.Multi or false
-    Info.Default = Info.Default or nil
-    Info.List = Info.List or {}
-    Info.ChangeText = Info.ChangeText or true
-
-    local State = false
-
-    local DropdownTable = {}
-    DropdownTable.Index = DropIndex
-    local DropdownY = 0
-
-    local Dropdown = Utilities:Create("Frame", {
-        Name = "Dropdown",
-        BackgroundTransparency = 1,
-        Parent = SectionContainer,
-        Size = UDim2.new(0, 286, 0, 21)
-    }, {
-        Utilities:Create("Frame", {
-            Name = "DropdownFrame",
-            Size = UDim2.new(.6, 3, 0, 14),
-            BackgroundColor3 = Colors.Secondary,
-            ClipsDescendants = true,
-            ZIndex = DropdownTable.Index
-        }, {
-            Utilities:Create("UIStroke", {
-                Color = Colors.AccentDivider
-            }),
-            Utilities:Create("TextLabel", {
-                Name = "DropdownText",
-                BackgroundTransparency = 1,
-                Text = Info.Text,
-                Size = UDim2.new(1, 0, 0, 14),
-                TextXAlignment = Enum.TextXAlignment.Left,
-                RichText = true,
-                Position = UDim2.new(0, 4, 0, 0),
-                TextSize = 13,
-                TextColor3 = Colors.TertiaryText,
-                Font = Enum.Font.SourceSansBold,
-                ZIndex = DropdownTable.Index
-            }),
-            Utilities:Create("TextButton", {
-                Name = "DropdownButton",
-                BackgroundTransparency = 1,
-                Size = UDim2.new(1, 0, 0, 14),
-                ZIndex = DropdownTable.Index
-            }),
-            Utilities:Create("Frame", {
-                Name = "DropdownContainer",
-                Size = UDim2.new(1, 0, 0, 0),
-                BackgroundTransparency = 1,
-                ClipsDescendants = true,
-                Position = UDim2.new(0, 0, 0, 14),
-                ZIndex = DropdownTable.Index
-            }, {
-                Utilities:Create("UIListLayout")
-            }),
-            Utilities:Create("Frame", {
-                Name = "GradientHolder",
-                Size = UDim2.new(0, 20, 0, 14),
-                BackgroundColor3 = Color3.fromRGB(255, 255, 255),
-                Position = UDim2.new(1, -41, 0, 0),
-                ZIndex = DropdownTable.Index
-            }, {
-                Utilities:Create("UIGradient", {
-                    Color = ColorSequence.new({
-                        ColorSequenceKeypoint.new(0, Colors.Secondary),
-                        ColorSequenceKeypoint.new(1, Colors.Secondary),
-                    }),
-                    Transparency = NumberSequence.new({
-                        NumberSequenceKeypoint.new(0, 1),
-                        NumberSequenceKeypoint.new(1, 0),
-                    })
-                })
-            }),
-            Utilities:Create("Frame", {
-                Name = "DropdownImageContainer",
-                Size = UDim2.new(0, 21, 0, 14),
-                BackgroundColor3 = Colors.Tertiary,
-                Position = UDim2.new(1, -21, 0, 0),
-                ZIndex = DropdownTable.Index
-            }, {
-                Utilities:Create("UIStroke", {
-                    Color = Colors.AccentDivider
-                }),
-                Utilities:Create("ImageLabel", {
-                    Name = "DropdownImage",
-                    Size = UDim2.new(0, 10, 0, 10),
-                    BackgroundTransparency = 1,
-                    Rotation = 0, -- 180
-                    Image = getcustomasset("PPHUD/Arrow.png"),
-                    AnchorPoint = Vector2.new(.5, .5),
-                    Position = UDim2.new(.5, 0, .5, 0),
-                    ZIndex = DropdownTable.Index
-                })
-            })
-        })
-    })
-
-    SizeX:GetPropertyChangedSignal("Value"):Connect(function()
-        local Size = SizeX.Value / 2 - 14
-        Dropdown.Size = UDim2.new(0, Size, 0, 21)
-      end)
-
-    Dropdown.DropdownFrame.MouseEnter:Connect(function()
-        if not State then
-            Utilities:Tween(Dropdown.DropdownFrame, .125, {BackgroundColor3 = Colors.Hovering})
-        end
-    end)
-
-    Dropdown.DropdownFrame.MouseLeave:Connect(function()
-        if not State then
-            Utilities:Tween(Dropdown.DropdownFrame, .125, {BackgroundColor3 = Colors.Secondary})
-        end
-    end)
-
-    local DropdownContainer = Dropdown.DropdownFrame.DropdownContainer
-    local DropdownImage = Dropdown.DropdownFrame.DropdownImageContainer.DropdownImage
-
-    function DropdownTable:Toggle(bool)
-        State = bool
-
-        if State then
-            Utilities:Tween(Dropdown.DropdownFrame, .2, {BackgroundColor3 = Colors.Secondary})
-            DropdownContainer.Size = DropdownContainer.Size + UDim2.fromOffset(0, DropdownY)
-            Dropdown.DropdownFrame.Size = Dropdown.DropdownFrame.Size + UDim2.fromOffset(0, DropdownY)
-            DropdownImage.Rotation = 90
-        else
-            DropdownContainer.Size = DropdownContainer.Size - UDim2.fromOffset(0, DropdownY)
-            Dropdown.DropdownFrame.Size = Dropdown.DropdownFrame.Size - UDim2.fromOffset(0, DropdownY)
-            DropdownImage.Rotation = 0
-        end
-    end
-
-    if Info.Default then
-        task.spawn(Info.Callback, Info.Default)
-        if Info.Flag then
-            library[Info.Flag] = Info.Default
-        end
-        if Info.ChangeText then
-            Dropdown.DropdownFrame.DropdownText.Text = Info.Default
-        end
-    end
-
-    function DropdownTable:Select(v, silent)
-        if not silent then task.spawn(Info.Callback, v) end
-
-        if Info.ChangeText then
-            Dropdown.DropdownFrame.DropdownText.Text = v
-        end
-    end
-
-    local MultiTable = {}
-
-    local function OnPick(v)
-        if Info.Multi then
-            if not table.find(MultiTable, v.DropdownElementText.Text) then
-                Utilities:Tween(v, .125, {BackgroundTransparency = .95})
-                Utilities:Tween(v.DropdownElementText, .125, {TextColor3 = Colors.Accent})
-                table.insert(MultiTable, v.DropdownElementText.Text)
-            else
-                Utilities:Tween(v, .125, {BackgroundTransparency = 1})
-                Utilities:Tween(v.DropdownElementText, .125, {TextColor3 = Colors.PrimaryText})
-                for i, e in pairs(MultiTable) do
-                    if v.DropdownElementText.Text == e then
-                        table.remove(MultiTable, i)
-                    end
-                end
-            end
-            task.spawn(Info.Callback, MultiTable)
-
-            if Info.ChangeText then
-                Dropdown.DropdownFrame.DropdownText.Text = ""
-                for i, z in pairs(MultiTable) do
-                    Dropdown.DropdownFrame.DropdownText.Text ..= i ~= #MultiTable and z..", " or z
-                end
-                if string.len(Dropdown.DropdownFrame.DropdownText.Text) == 0 then
-                    Dropdown.DropdownFrame.DropdownText.Text = Info.Text
-                end
-            end
-        else
-            DropdownTable:Select(v.DropdownElementText.Text)
-            DropdownTable:Toggle(false)
-        end
-    end
-
-    function DropdownTable:Refresh(table)
-        for _, v in pairs(DropdownContainer:GetChildren()) do
-            if v.ClassName == "Frame" then
-                v:Destroy()
-                DropdownY = DropdownY - 14
-
-                if State then
-                    DropdownContainer.Size = DropdownContainer.Size - UDim2.fromOffset(0, 14)
-                    Dropdown.DropdownFrame.Size = Dropdown.DropdownFrame.Size - UDim2.fromOffset(0, 14)
-                end
-            end
-        end
-
-        for _, v in pairs(table) do
-            DropdownTable:Add(v)
-        end
-    end
-
-    function DropdownTable:Add(str)
-        DropdownY = DropdownY + 14
-
-        if State then
-            DropdownContainer.Size = DropdownContainer.Size + UDim2.fromOffset(0, 14)
-            Dropdown.DropdownFrame.Size = Dropdown.DropdownFrame.Size + UDim2.fromOffset(0, 14)
-        end
-
-        local DropdownElement = Utilities:Create("Frame", {
-            Name = "DropdownElement",
-            Size = UDim2.new(1, 0, 0, 14),
-            Parent = DropdownContainer,
-            BackgroundTransparency = 1,
-            ZIndex = DropdownTable.Index
-        }, {
-            Utilities:Create("TextLabel", {
-                Name = "DropdownElementText",
-                Text = str,
-                Size = UDim2.new(1, 0, 1, 0),
-                TextSize = 13,
-                BackgroundTransparency = 1,
-                RichText = true,
-                TextColor3 = Colors.PrimaryText,
-                Font = Enum.Font.SourceSansBold,
-                ZIndex = DropdownTable.Index
-            }),
-            Utilities:Create("TextButton", {
-                Name = "DropdownElementButton",
-                Size = UDim2.new(1, 0, 1, 0),
-                BackgroundTransparency = 1,
-                ZIndex = DropdownTable.Index
-            })
-        })
-
-        DropdownElement.MouseEnter:Connect(function()
-            if not table.find(MultiTable, DropdownElement.DropdownElementText.Text) then
-                Utilities:Tween(DropdownElement, .125, {BackgroundTransparency = .95})
-                Utilities:Tween(DropdownElement.DropdownElementText, .125, {TextColor3 = Colors.Accent})
-            end
-        end)
-
-        DropdownElement.MouseLeave:Connect(function()
-            if not table.find(MultiTable, DropdownElement.DropdownElementText.Text) then
-                Utilities:Tween(DropdownElement, .125, {BackgroundTransparency = 1})
-                Utilities:Tween(DropdownElement.DropdownElementText, .125, {TextColor3 = Colors.PrimaryText})
-            end
-        end)
-
-        DropdownElement.DropdownElementButton.MouseButton1Click:Connect(function()
-            OnPick(DropdownElement)
-        end)
-    end
-
-    for _, v in pairs(Info.List) do
-        DropdownTable:Add(v)
-    end
-
-    Dropdown.DropdownFrame.DropdownButton.MouseButton1Click:Connect(function()
-        State = not State
-
-        DropdownTable:Toggle(State)
-    end)
-
-    DropIndex = DropIndex - 1
-
-    return DropdownTable
-  end
-
-  return SectionTable
-  end
-  
-  return TabTable
-  end
-  
-  return WindowTable
-  end
-
-  return library
-end
-local loaded, library = pcall(loadLibrary)
-if not loaded then warn("[TITAN UI] PPHud initialization failed; check executor file/HTTP/asset APIs."); return end
-window = library:Window({Text = "Titan Farm | PPHud"})
-local tab = window:Tab({Text = "Main"})
-local farmSection = tab:Section({Text = "Auto Farm", Side = "Left"})
-local farmCheck = farmSection:Check({Text = "Auto Farm", Callback = function(value)
-    app.farm = value
-    if not value then releaseCharacter() end
-end})
-farmCheck:Set(app.farm)
-local retryCheck = farmSection:Check({Text = "Auto Retry", Callback = function(value) app.retry = value end})
-retryCheck:Set(app.retry)
-local selectingSlot = false
-local selectedSlot = "A"
-farmSection:Dropdown({Text = "Slot: A", List = {"A"}, Callback = function(value)
-    if value == "A" then selectedSlot = value end
-end})
-farmSection:Button({Text = "Select", Callback = function()
-    if selectingSlot or not app.running then return end
-    local button = Players.LocalPlayer:FindFirstChild("PlayerGui")
-    for _, name in ipairs({"Interface", "Title_Screen", "Slots", selectedSlot, "Select_" .. selectedSlot}) do
-        button = button and button:FindFirstChild(name)
-    end
-    if not button or not button:IsA("GuiButton") then
-        warn("[TITAN UI] Select_A button not loaded / not a GuiButton."); return
-    end
-    local ancestor = button
-    while ancestor and ancestor ~= game do
-        if (ancestor:IsA("GuiObject") and not ancestor.Visible)
-            or (ancestor:IsA("ScreenGui") and not ancestor.Enabled) then
-            warn("[TITAN UI] Slot selection UI is hidden."); return
-        end
-        ancestor = ancestor.Parent
-    end
-    selectingSlot = true
-    local function teleportAfterSelect()
-        task.wait(1)
-        if not app.running then return end
-        local remote = automationRemote("GET")
-        if not remote or not remote:IsA("RemoteFunction") then
-            warn("[TITAN UI] GET not ready for Lobby teleport."); return
-        end
-        local ok = pcall(function() remote:InvokeServer("Functions", "Teleport", "Lobby", nil) end)
-        if ok then print("[TITAN UI] Requested Lobby teleport after Select A.")
-        else warn("[TITAN UI] Lobby teleport request failed.") end
-    end
-    -- Trigger the game's own UI handler so its transition code can run too.
-    -- Never fire both click and Activated: that could select the slot twice.
-    local handlerDispatched = false
+local function selectSlot(button)
+    -- Use one signal only, so the same selection is not dispatched twice.
     if type(getconnections) == "function" then
         for _, eventName in ipairs({"MouseButton1Click", "Activated"}) do
             local inspected, handlers = pcall(function() return getconnections(button[eventName]) end)
@@ -1586,10 +103,11 @@ farmSection:Button({Text = "Select", Callback = function()
                         if connection.Enabled == false then return nil end
                         return connection.Fire
                     end)
-                    if accessible and type(fire) == "function" then usable[#usable + 1] = connection end
+                    if accessible and type(fire) == "function" then
+                        usable[#usable + 1] = connection
+                    end
                 end
                 if #usable > 0 then
-                    handlerDispatched = true
                     local failed = false
                     for _, connection in ipairs(usable) do
                         local fired = pcall(function()
@@ -1598,1166 +116,469 @@ farmSection:Button({Text = "Select", Callback = function()
                         end)
                         failed = failed or not fired
                     end
-                    if failed then warn("[TITAN UI] A Select_A callback failed; not sending duplicate input.")
-                    else
-                        print("[TITAN UI] Dispatched Select_A " .. eventName .. " handlers; check game transition.")
-                        teleportAfterSelect()
-                    end
-                    break
+                    if failed then error("A Select_A callback failed; refusing duplicate input.") end
+                    return
                 end
             end
         end
     end
-    if handlerDispatched then
-        selectingSlot = false
-        return
-    end
-    selectingSlot = false
-    local inputReady, gui, virtualInput = pcall(function()
-        return game:GetService("GuiService"), game:GetService("VirtualInputManager")
-    end)
-    if not inputReady then
-        warn("[TITAN UI] No usable UI callbacks or virtual input. Tap Select_A manually."); return
-    end
-    selectingSlot = true
+
+    -- Same virtual-input fallback as the source selection flow.
+    local gui = game:GetService("GuiService")
+    local virtualInput = game:GetService("VirtualInputManager")
     local previousSelectable = button.Selectable
+    local previousSelection = gui.SelectedObject
     local function key(code)
         virtualInput:SendKeyEvent(true, code, false, game)
         task.wait(0.05)
         virtualInput:SendKeyEvent(false, code, false, game)
     end
-    local ok = pcall(function()
+    local ok, message = pcall(function()
         key(Enum.KeyCode.BackSlash)
         task.wait(0.1)
-        if not app.running then return end
         button.Selectable = true
         gui.SelectedObject = button
         task.wait(0.1)
-        if not app.running then return end
-        if gui.SelectedObject ~= button then error("Slot button could not be focused") end
+        if gui.SelectedObject ~= button then error("Select_A could not be focused.") end
         key(Enum.KeyCode.Return)
         task.wait(0.8)
-        if not app.running or not button.Parent then return end
-        local node = button
-        while node and node ~= game do
-            if (node:IsA("GuiObject") and not node.Visible)
-                or (node:IsA("CanvasGroup") and node.GroupTransparency >= 0.99)
-                or (node:IsA("ScreenGui") and not node.Enabled) then return end
-            node = node.Parent
-        end
-        -- Some game buttons only connect MouseButton1Click, not Activated.
-        -- One fallback click, only if the original slot UI is still visible.
+        if not isVisible(button) then return end
         gui.SelectedObject = nil
         local position, size = button.AbsolutePosition, button.AbsoluteSize
-        if size.X <= 0 or size.Y <= 0 then error("Slot button has no visible size") end
+        if size.X <= 0 or size.Y <= 0 then error("Select_A has no visible size.") end
         local x, y = position.X + size.X / 2, position.Y + size.Y / 2
         virtualInput:SendMouseMoveEvent(x, y, game)
         task.wait(0.05)
         virtualInput:SendMouseButtonEvent(x, y, 0, true, game, 0)
         task.wait(0.1)
         virtualInput:SendMouseButtonEvent(x, y, 0, false, game, 0)
-        print("[TITAN UI] Enter did not hide slot UI; sent one fallback click.")
     end)
     pcall(function()
         virtualInput:SendKeyEvent(false, Enum.KeyCode.BackSlash, false, game)
         virtualInput:SendKeyEvent(false, Enum.KeyCode.Return, false, game)
-        if gui.SelectedObject == button then gui.SelectedObject = nil end
+        local position = button.AbsolutePosition
+        virtualInput:SendMouseButtonEvent(position.X, position.Y, 0, false, game, 0)
+    end)
+    pcall(function()
+        if gui.SelectedObject == button then gui.SelectedObject = previousSelection end
         button.Selectable = previousSelectable
     end)
-    if ok and app.running then teleportAfterSelect() end
-    selectingSlot = false
-    if ok then print("[TITAN UI] Requested slot A selection.")
-    else warn("[TITAN UI] Slot A selection request failed.") end
-end})
-farmSection:Button({Text = "To lobby", Callback = function()
-    if not requestLobby("manual") then
-        warn("[TITAN UI] Cannot leave yet: already in lobby, teleport pending, or character/POST not ready.")
+    if not ok then error("Slot A input failed: " .. tostring(message)) end
+end
+
+local function selectLobby()
+    if not waitForValue(function() return game:IsLoaded() end) then
+        error("Game did not finish loading within 30 seconds.")
     end
-end})
-local leaveCheck = farmSection:Check({Text = "Auto Leave (server count)", Callback = function(value)
-    app.autoLeave = value; saveAutomation()
-end})
-leaveCheck:Set(app.autoLeave)
-farmSection:NumberInput({Text = "Servers before leave", Minimum = 1, Maximum = 1000000, Default = app.maxGames,
-    Callback = function(value) app.maxGames = value; saveAutomation() end})
-local upgradeCheck = farmSection:Check({Text = "Auto Upgrade (return at Gold)", Callback = function(value)
-    app.autoUpgrade = value; saveAutomation()
-end})
-upgradeCheck:Set(app.autoUpgrade)
-farmSection:NumberInput({Text = "Gold target (1 - 1B)", Minimum = 1, Maximum = 1000000000, Default = app.goldTarget,
-    Callback = function(value) app.goldTarget = value; saveAutomation() end})
-farmSection:Slider({Text = "Height", Minimum = 50, Maximum = 1000, Default = 380, Incrementation = 1,
-    Callback = function(value) app.height = value end})
-farmSection:Slider({Text = "Tween speed", Minimum = 50, Maximum = 1500, Default = 380, Incrementation = 1,
-    Callback = function(value) app.speed = value end})
-farmSection:Slider({Text = "Distance offset", Minimum = 0, Maximum = 50, Default = 2, Incrementation = 1,
-    Callback = function(value) app.distance = value end})
-local hooks = tab:Section({Text = "Discord / Rewards", Side = "Right"})
-local hookCheck = hooks:Check({Text = "Send Rewards webhook", Callback = function(value) app.webhook = value end})
-hookCheck:Set(app.webhook)
-local status = hooks:Label({Text = "Webhook: ready"})
-hooks:Button({Text = "Use webhook URL from clipboard", Callback = function()
-    if type(getclipboard) ~= "function" then status:Set("Executor has no getclipboard()"); return end
-    local ok, url = pcall(getclipboard)
-    if not ok or type(url) ~= "string" then status:Set("Cannot read clipboard"); return end
-    url = url:match("^%s*(.-)%s*$")
-    if not url:match("^https://discord%.com/api/webhooks/%d+/[%w_%-]+$") then
-        status:Set("Invalid Discord webhook URL"); return
+    if not lobbyPlaces[game.GameId] then error("Unsupported game; no known lobby place.") end
+    if lobbyPlaces[game.GameId] == game.PlaceId then
+        print("[AUTO PRESTIGE] Step 1 complete: already in Lobby.")
+        return true
     end
-    app.url = url
-    status:Set("Webhook URL updated (this session)")
-end})
-hooks:Button({Text = "Test webhook", Callback = function()
-    if not webhookSend then status:Set("Tracker is starting"); return end
-    local ok, reason = webhookSend({{name = "Test", value = "PPHud webhook connected", inline = false}})
-    status:Set(ok and "Test: HTTP 2xx" or (reason or "Test failed"))
-end})
-local info = hooks:Label({Text = "Waiting for game data"})
-hooks:Button({Text = "Refresh map / mode / balances", Callback = function()
-    if webhookDetails then print("[TITAN UI] " .. webhookDetails("")) end
-    if webhookBalance then
-        local gold, gems = webhookBalance()
-        info:Set("Gold: " .. tostring(gold or "?") .. " | Gems: " .. tostring(gems or "?"))
-    end
-end})
-farmSection:Button({Text = "Hide UI (RightShift to show)", Callback = function() window:Toggle() end})
-farmSection:Button({Text = "Stop script", Callback = app.stop})
-connections[#connections + 1] = game:GetService("UserInputService").InputBegan:Connect(function(input, processed)
-    if not processed and input.KeyCode == Enum.KeyCode.RightShift then window:Toggle() end
-end)
--- Mission creation uses the GET calls supplied by the user. No auto-Start.
-do
-local objectives = {
-    Missions = {Shiganshina = {"Skirmish", "Breach", "Random"}, Trost = {"Skirmish", "Protect", "Random"},
-        Outskirts = {"Skirmish", "Escort", "Random"}, Forest = {"Skirmish", "Guard", "Random"},
-        Utgard = {"Skirmish", "Defend", "Random"}, Docks = {"Skirmish", "Stall", "Random"},
-        Stohess = {"Skirmish", "Random"}, Chapel = {"Skirmish", "Random"}},
-    Raids = {Shiganshina = {"Armored Titan", "Colossal Titan"}, Trost = {"Attack Titan"}, Stohess = {"Female Titan"}},
-    Waves = {Trost = {"Waves"}},
-}
-local normalTags = {"No Perks", "No Skills", "No Memories", "Nightmare", "Oddball", "Injury Prone",
-    "Chronic Injuries", "Fog", "Glass Cannon", "Time Trial", "Fatigue", "Evolution", "Boring", "Simple", "Primitive"}
-local waveTags = {"Inflation", "Merchant's Greed", "Unworthy", "Shortage", "Juggernaut", "Tipping Point"}
-local details = {
-    ["No Perks"] = "+5% Gold/XP cho mỗi perk đang trang bị.",
-    ["No Skills"] = "+3% Gold/XP cho mỗi skill đang trang bị.",
-    ["No Memories"] = "+2,5% Gold/XP cho mỗi memory đã mở khóa.",
-    Nightmare = "+20% Gold/XP; chỉ xuất hiện abnormal/crawler.",
-    Oddball = "+25% Gold/XP; mọi Titan tăng 50% chỉ số.",
-    ["Injury Prone"] = "+10% Gold/XP; tăng nguy cơ chấn thương.",
-    ["Chronic Injuries"] = "+10% Gold/XP; chấn thương không thể chữa.",
-    Fog = "+7,5% Gold/XP; tầm nhìn bị giảm mạnh.",
-    ["Glass Cannon"] = "+25% Gold/XP; HP tối đa chỉ còn 1.",
-    ["Time Trial"] = "+15% Gold/XP nếu kịp thời gian; quá giờ bị -15%.",
-    Fatigue = "+10% Gold/XP; Awakening/Cooldown chậm hơn 25%.",
-    Evolution = "+15% Gold/XP; mọi abnormal đều là variant.",
-    Boring = "-20% Gold/XP; không xuất hiện abnormal/crawler.",
-    Simple = "-20% Gold/XP; mọi Titan giảm 20% chỉ số.",
-    Primitive = "-15% Gold/XP; không có abnormal dạng variant.",
-    Inflation = "+10% Shards; chi phí nâng cấp HQ tăng 15%.",
-    ["Merchant's Greed"] = "+10% Shards; giá Market tăng 10%.",
-    Unworthy = "+10% Shards; Blessing đắt hơn 12,5%, failed rolls +5%.",
-    Shortage = "+10% Shards; Skill Crate hiếm hơn và không đánh dấu.",
-    Juggernaut = "+20% Shards; Boss Titan tăng 15% chỉ số.",
-    ["Tipping Point"] = "+15% Shards; độ tăng tiến theo wave tăng 15%.",
-}
-local blacklists = {Stall = {Nightmare = true, Boring = true, ["Time Trial"] = true, Evolution = true, Primitive = true},
-    ["Female Titan"] = {Nightmare = true, Boring = true, Evolution = true, Primitive = true}}
-local forced = {Nightmare = true, Fatigue = true, Evolution = true}
-local disabled = {Boring = true, Simple = true, Primitive = true}
-local conflicts = {Simple = {"Oddball"}, Oddball = {"Simple"}, Boring = {"Nightmare", "Evolution", "Primitive"},
-    Nightmare = {"Boring"}, Evolution = {"Primitive", "Boring"}, Primitive = {"Evolution", "Boring"}}
-local selection = {Type = "Missions", Name = "Shiganshina", Objective = "Skirmish", Difficulty = "Hard"}
-local selectedTags, busy = {}, false
-local missionTab = window:Tab({Text = "Missions"})
-local setup = missionTab:Section({Text = "Mission selection", Side = "Left"})
-local modifiers = missionTab:Section({Text = "Modifiers (select then Create)", Side = "Right"})
-modifiers:Label({Text = "Missions: Gold/XP. Raids: đổi thành Luck; mức thưởng/phạt chia đôi (trừ Boring, Simple).", Height = 58, Wrapped = true})
-local message = setup:Label({Text = "Create in lobby; auto Start after 3 seconds"})
-local function allowed(tag)
-    if blacklists[selection.Objective] and blacklists[selection.Objective][tag] then return false end
-    if selection.Difficulty == "Freedom" and disabled[tag] then return false end
-    local tags = selection.Type == "Waves" and waveTags or normalTags
-    for _, value in ipairs(tags) do if value == tag then return true end end
+    local player = waitForValue(function() return Players.LocalPlayer end)
+    if not player then error("LocalPlayer did not load.") end
+    local button = waitForValue(function()
+        local node = player:FindFirstChild("PlayerGui")
+        for _, name in ipairs({"Interface", "Title_Screen", "Slots", "A", "Select_A"}) do
+            node = node and node:FindFirstChild(name)
+        end
+        if node and node:IsA("GuiButton") and isVisible(node) then return node end
+    end)
+    if not button then error("Visible Select_A button did not load; start from the slot-selection screen.") end
+    selectSlot(button)
+    task.wait(1)
+    local remote = waitForValue(function()
+        local assets = ReplicatedStorage:FindFirstChild("Assets")
+        local remotes = assets and assets:FindFirstChild("Remotes")
+        local get = remotes and remotes:FindFirstChild("GET")
+        if get and get:IsA("RemoteFunction") then return get end
+    end)
+    if not remote then error("Assets.Remotes.GET did not load.") end
+    remote:InvokeServer("Functions", "Teleport", "Lobby", nil)
+    -- A successful invocation is a request, not proof that teleport completed.
+    print("[AUTO PRESTIGE] Step 1: selected Slot A and requested Lobby teleport.")
     return false
 end
-local checks, suppress = {}, {}
-local function synchronize()
-    for tag in pairs(selectedTags) do if not allowed(tag) then selectedTags[tag] = nil end end
-    if selection.Difficulty == "Freedom" and selection.Type ~= "Waves" then
-        for tag in pairs(forced) do if allowed(tag) then selectedTags[tag] = true end end
-    end
-    for tag, check in pairs(checks) do
-        local wanted = selectedTags[tag] == true
-        -- Check:Set dispatches asynchronously: ignore the corresponding echo.
-        suppress[tag] = wanted
-        check:Set(wanted)
-    end
-end
-for _, tag in ipairs(normalTags) do
-    local currentTag = tag
-    checks[currentTag] = modifiers:Check({Text = currentTag, Callback = function(value)
-        if suppress[currentTag] ~= nil and suppress[currentTag] == value then suppress[currentTag] = nil; return end
-        if busy then synchronize(); return end
-        if not allowed(currentTag) or (not value and selection.Difficulty == "Freedom" and forced[currentTag]) then
-            message:Set("Modifier unavailable / required: " .. currentTag); synchronize(); return
-        end
-        selectedTags[currentTag] = value or nil
-        if value then for _, other in ipairs(conflicts[currentTag] or {}) do selectedTags[other] = nil end end
-        synchronize()
-    end})
-    modifiers:Label({Text = details[currentTag], Height = 44, Wrapped = true})
-end
-for _, tag in ipairs(waveTags) do
-    local currentTag = tag
-    checks[currentTag] = modifiers:Check({Text = currentTag, Callback = function(value)
-        if suppress[currentTag] ~= nil and suppress[currentTag] == value then suppress[currentTag] = nil; return end
-        if busy or not allowed(currentTag) then message:Set("Choose Waves for " .. currentTag); synchronize(); return end
-        selectedTags[currentTag] = value or nil
-    end})
-    modifiers:Label({Text = details[currentTag], Height = 44, Wrapped = true})
-end
-local mapDropdown, objectiveDropdown, modeDropdown, difficultyDropdown
-local gradeIndexes = {["E-"] = 0, E = 1, ["E+"] = 2, ["D-"] = 3, D = 4, ["D+"] = 5,
-    ["C-"] = 6, C = 7, ["C+"] = 8, ["B-"] = 9, B = 10, ["B+"] = 11,
-    ["A-"] = 12, A = 13, ["A+"] = 14, ["S-"] = 15}
-local requirements = {
-    Missions = {{"Easy", 0}, {"Normal", 2}, {"Hard", 5}, {"Severe", 9}, {"Aberrant", 12}, {"Freedom", 15}},
-    Raids = {{"Hard", 6}, {"Severe", 10}, {"Aberrant", 13}, {"Freedom", 15}}, Waves = {{"Easy", 0}},
-}
-local gradeLabel = setup:Label({Text = "Grade: open Equipment > Upgrades, then Refresh grade", Height = 44, Wrapped = true})
-local function readGrade()
-    local node = Players.LocalPlayer:FindFirstChild("PlayerGui")
-    for _, name in ipairs({"Interface", "Equipment", "Categories", "Upgrades", "Main", "Title"}) do
-        node = node and node:FindFirstChild(name)
-    end
-    local text = node and node.Text or ""
-    text = text:gsub("<[^>]*>", ""):upper()
-    local grade = text:match("%[([A-S][%+%-]?)%s+GRADE%]") or text:match("%[GRADE%s+([A-S][%+%-]?)%]")
-    return grade and gradeIndexes[grade], grade
-end
-local function availableDifficulties()
-    local potential, grade = readGrade()
-    local prestige = Players.LocalPlayer:GetAttribute("Prestige")
-    local list = {}
-    if potential then
-        for index, requirement in ipairs(requirements[selection.Type]) do
-            local raidAllowed = selection.Type ~= "Raids" or selection.Objective ~= "Colossal Titan" or index >= 3
-            if raidAllowed and potential >= requirement[2]
-                and (requirement[1] ~= "Freedom" or (type(prestige) == "number" and prestige >= 3)) then
-                list[#list + 1] = requirement[1]
-            end
-        end
-    end
-    return list, grade
-end
-local function refreshDifficulties()
-    if not difficultyDropdown then return end
-    local list, grade = availableDifficulties()
-    local currentAllowed = false
-    for _, value in ipairs(list) do if value == selection.Difficulty then currentAllowed = true end end
-    if not currentAllowed then selection.Difficulty = list[#list] end
-    difficultyDropdown:Refresh(list)
-    difficultyDropdown:Select(selection.Difficulty or "No eligible difficulty", true)
-    gradeLabel:Set(grade and ("Equipment grade: " .. grade .. " | Eligible: " .. (#list > 0 and table.concat(list, ", ") or "none"))
-        or "Grade unavailable: open Equipment > Upgrades, then Refresh grade")
-    synchronize()
-end
-setup:Button({Text = "Refresh grade", Callback = function() if not busy then refreshDifficulties() end end})
-local function refreshObjectives()
-    local list = objectives[selection.Type][selection.Name]
-    selection.Objective = list[1]
-    objectiveDropdown:Refresh(list)
-    objectiveDropdown:Select(selection.Objective, true)
-    refreshDifficulties()
-    synchronize()
-end
-local function modesForMap(map)
-    local modes = {}
-    for _, mode in ipairs({"Missions", "Raids", "Waves"}) do
-        if objectives[mode][map] then modes[#modes + 1] = mode end
-    end
-    return modes
-end
-mapDropdown = setup:Dropdown({Text = "Map: Shiganshina", List = {"Shiganshina", "Trost", "Outskirts", "Forest", "Utgard", "Docks", "Stohess", "Chapel"}, Callback = function(value)
-    if busy or not objectives.Missions[value] then return end
-    selection.Name = value
-    local modes = modesForMap(value)
-    if not objectives[selection.Type][value] then selection.Type = modes[1] end
-    modeDropdown:Refresh(modes)
-    modeDropdown:Select(selection.Type, true)
-    refreshObjectives()
-end})
-modeDropdown = setup:Dropdown({Text = "Mode: Missions", List = modesForMap(selection.Name), Callback = function(value)
-    if busy or not objectives[value] or not objectives[value][selection.Name] then return end
-    selection.Type = value
-    refreshObjectives()
-end})
-objectiveDropdown = setup:Dropdown({Text = "Objective: Skirmish", List = objectives.Missions.Shiganshina, Callback = function(value)
-    if busy then return end
-    for _, objective in ipairs(objectives[selection.Type][selection.Name]) do
-        if objective == value then selection.Objective = value; refreshDifficulties(); synchronize(); break end
-    end
-end})
-difficultyDropdown = setup:Dropdown({Text = "Difficulty: Hard", List = {}, Callback = function(value)
-    if busy then return end
-    local list = availableDifficulties()
-    for _, allowedDifficulty in ipairs(list) do
-        if value == allowedDifficulty then selection.Difficulty = value; synchronize(); return end
-    end
-    refreshDifficulties()
-end})
-refreshDifficulties()
-setup:Button({Text = "Create mission + selected modifiers", Callback = function()
-    if busy then return end
-    if not atLobby() then message:Set("Return to lobby before creating mission"); return end
-    local eligible, grade = availableDifficulties()
-    local validDifficulty = false
-    for _, value in ipairs(eligible) do if value == selection.Difficulty then validDifficulty = true end end
-    if not validDifficulty then
-        refreshDifficulties()
-        message:Set(grade and "Difficulty changed / not eligible; check selection and click Create again"
-            or "Open Equipment > Upgrades first, then Refresh grade")
-        return
-    end
-    local remote = automationRemote("GET")
-    if not remote or not remote:IsA("RemoteFunction") then message:Set("GET remote not ready"); return end
-    synchronize()
-    local config = {Name = selection.Name, Type = selection.Type, Objective = selection.Objective, Difficulty = selection.Difficulty}
-    local desired = {}
-    for _, tag in ipairs(config.Type == "Waves" and waveTags or normalTags) do desired[tag] = selectedTags[tag] == true end
-    busy = true
-    message:Set("Creating mission...")
-    local ok, err = pcall(function()
-        local object = remote:InvokeServer("S_Missions", "Create", config)
-        local function matches(candidate)
-            if typeof(candidate) ~= "Instance" or not candidate.Parent or candidate.Name ~= config.Name then return false end
-            local host = candidate:FindFirstChild("Leader")
-            return host and host.Value == Players.LocalPlayer.Name and candidate.Value == config.Difficulty
-                and candidate:GetAttribute("Type") == config.Type and candidate:GetAttribute("Objective") == config.Objective
-        end
-        if not matches(object) then
-            local responseType = typeof(object)
-            local responseText = type(object) == "string" and object or responseType
-            local deadline = os.clock() + 3
-            object = nil
-            repeat
-                local missions = game:GetService("ReplicatedStorage"):FindFirstChild("Missions")
-                if missions then
-                    for _, candidate in ipairs(missions:GetChildren()) do
-                        if matches(candidate) then object = candidate; break end
-                    end
-                end
-                if not object then task.wait(0.1) end
-            until object or not app.running or os.clock() >= deadline
-            if not object then
-                error("Create returned " .. responseText .. "; no matching mission replicated. Config: "
-                    .. config.Name .. "/" .. config.Type .. "/" .. config.Objective .. "/" .. config.Difficulty
-                    .. ". Check grade/prestige, existing party and game notifications.")
-            end
-        end
-        local leader = object:FindFirstChild("Leader")
-        if not leader or leader.Value ~= Players.LocalPlayer.Name then error("Not mission leader") end
-        -- Toggle only mismatched states. Disable first to avoid conflicting tags.
-        for _, target in ipairs({false, true}) do
-            for _, tag in ipairs(config.Type == "Waves" and waveTags or normalTags) do
-                if not app.running then return end
-                if desired[tag] == target then
-                    local state = object:GetAttribute("Modifiers")
-                    if type(state) ~= "string" then error("Modifiers attribute not ready") end
-                    local enabled = state:find(tag, 1, true) ~= nil
-                    if enabled ~= target then
-                        remote:InvokeServer("S_Missions", "Modify", tag)
-                        local deadline = os.clock() + 2
-                        repeat task.wait(0.05)
-                            state = object:GetAttribute("Modifiers")
-                        until type(state) == "string" and (state:find(tag, 1, true) ~= nil) == target or os.clock() >= deadline
-                        if type(state) ~= "string" or (state:find(tag, 1, true) ~= nil) ~= target then error("Modifier refused: " .. tag) end
-                    end
-                end
-            end
-        end
-        message:Set("Created " .. config.Name .. "; starting in 3 seconds...")
-        task.wait(3)
-        if not app.running or app.leaving or not atLobby() then return end
-        if not object.Parent then error("Mission disbanded before Start") end
-        leader = object:FindFirstChild("Leader")
-        if not leader or leader.Value ~= Players.LocalPlayer.Name then error("Not leader before Start") end
-        remote:InvokeServer("S_Missions", "Start")
-        message:Set("Start requested: " .. config.Name .. " / " .. config.Objective)
-    end)
-    busy = false
-    if not ok then message:Set("Create/Modify/Start failed; see console"); warn("[MISSIONS] " .. tostring(err)) end
-end})
-end
-tab:Select()
-startAutomation()
--- Independent tracker: lobby has no Titans folder.
-do
--- Client/autoexec: send once when the end-of-match Rewards UI appears.
-local WEBHOOK_URL = "https://discord.com/api/webhooks/996043763858288700/z3Nh4ETcF5ZMeX3_C2CSs8R5ERoC4LJRHDoVjY773LNyHJfcLF2-0jZFEn8J17_62GKC"
-local Players = game:GetService("Players")
-local HttpService = game:GetService("HttpService")
-while not game:IsLoaded() do task.wait(0.25) end
-while not Players.LocalPlayer do task.wait(0.25) end
-local player = Players.LocalPlayer
 
-local env = type(getgenv) == "function" and getgenv() or _G
-local watcher = {}
-env.RewardsWebhookWatcher = watcher
-app.watcher = watcher
-
-local function childPath(node, names)
+local function findPath(root, names)
+    local node = root
     for _, name in ipairs(names) do node = node and node:FindFirstChild(name) end
     return node
 end
 
-local function visible(node)
-    if not node or not node:IsDescendantOf(game) then return false end
-    while node and node ~= game do
-        if node:IsA("GuiObject") and not node.Visible then return false end
-        if node:IsA("CanvasGroup") and node.GroupTransparency >= 0.99 then return false end
-        if node:IsA("ScreenGui") and not node.Enabled then return false end
-        node = node.Parent
-    end
-    return true
+local function awaitPath(root, names)
+    local node = waitForValue(function() return findPath(root, names) end)
+    assert(node, "UI did not load: " .. table.concat(names, "."))
+    return node
 end
 
-local function parseNumber(text)
-    local cleaned = tostring(text):gsub(",", ""):gsub("%s", "")
-    local number, suffix = cleaned:match("^%+?(%d+%.?%d*)([kKmMbB]?)$")
-    if not number then return nil end
-    return tonumber(number) * (({k = 1000, m = 1000000, b = 1000000000})[suffix:lower()] or 1)
+local function click(button)
+    assert(type(getconnections) == "function", "Executor requires getconnections for Equipment UI.")
+    local handlers = getconnections(button.MouseButton1Click)
+    assert(#handlers > 0, "No click handlers: " .. button:GetFullName())
+    for _, connection in ipairs(handlers) do connection:Fire() end
 end
 
-local function formatNumber(number)
-    local text = tostring(math.floor(number)):reverse():gsub("(%d%d%d)", "%1,"):reverse()
-    return (text:gsub("^,", ""))
-end
-
--- Executor file storage survives place teleports; scoped to game/account.
-local goldFile = "rewards_gold_" .. tostring(game.GameId) .. "_" .. tostring(player.UserId) .. ".json"
-local goldLedger = {balance = nil, lastMatch = nil, gems = nil, gemsMatch = nil}
-local storageWarned = false
-local function validBalance(value)
-    return type(value) == "number" and value == value and value >= 0 and value < math.huge
-end
-
-local function loadGold()
-    if type(readfile) ~= "function" then return end
-    local ok, saved = pcall(function() return HttpService:JSONDecode(readfile(goldFile)) end)
-    if ok and type(saved) == "table" and saved.userId == player.UserId
-        and saved.gameId == game.GameId and validBalance(saved.balance) then
-        goldLedger.balance = saved.balance
-        goldLedger.lastMatch = type(saved.lastMatch) == "string" and saved.lastMatch or nil
-        print("[WEBHOOK] Da doc Gold da luu: " .. formatNumber(saved.balance))
-    end
-    if ok and type(saved) == "table" and saved.userId == player.UserId
-        and saved.gameId == game.GameId and validBalance(saved.gems) then
-        goldLedger.gems = saved.gems
-        goldLedger.gemsMatch = type(saved.gemsMatch) == "string" and saved.gemsMatch or nil
-        print("[WEBHOOK] Da doc Gems da luu: " .. formatNumber(saved.gems))
-    end
-end
-
-local function saveGold()
-    local ok = false
-    if type(writefile) == "function" then
-        ok = pcall(function()
-            writefile(goldFile, HttpService:JSONEncode({userId = player.UserId, gameId = game.GameId,
-                balance = goldLedger.balance, lastMatch = goldLedger.lastMatch,
-                gems = goldLedger.gems, gemsMatch = goldLedger.gemsMatch}))
-        end)
-    end
-    if not ok and not storageWarned then
-        storageWarned = true
-        warn("[WEBHOOK] Khong luu duoc Gold ra file; so du co the mat sau teleport.")
-    end
-end
-
-local function captureLobbyGold(interface)
-    local gemsAmount = childPath(interface, {"Topbar", "Main", "Currencies", "Gems", "Amount"})
-    if gemsAmount and visible(gemsAmount) then
-        local gems = parseNumber(gemsAmount.Text)
-        if validBalance(gems) and gems ~= goldLedger.gems then
-            goldLedger.gems = gems
-            saveGold()
-            print("[WEBHOOK] Da luu Gems tu UI lobby: " .. formatNumber(gems))
-        end
-    end
-    local amount = childPath(interface, {"Topbar", "Main", "Currencies", "Gold", "Amount"})
-    -- Do not overwrite an estimate with stale, hidden in-match UI.
-    if not amount or not visible(amount) then return end
-    local balance = parseNumber(amount.Text)
-    if not validBalance(balance) or balance == goldLedger.balance then return end
-    goldLedger.balance = balance
-    saveGold()
-    print("[WEBHOOK] Da luu Gold tu UI lobby: " .. formatNumber(balance))
-end
-
-local function applyGoldReward(matchId, reward)
-    if not validBalance(reward) or goldLedger.lastMatch == matchId then return end
-    if validBalance(goldLedger.balance) then goldLedger.balance = goldLedger.balance + reward end
-    goldLedger.lastMatch = matchId
-    saveGold()
-end
-
-loadGold()
-app.goldBalance = goldLedger.balance
-
-local function applyGemsReward(matchId, reward)
-    if not validBalance(reward) or goldLedger.gemsMatch == matchId then return end
-    if validBalance(goldLedger.gems) then goldLedger.gems = goldLedger.gems + reward end
-    goldLedger.gemsMatch = matchId
-    saveGold()
-end
-
-local hoverNames = setmetatable({}, {__mode = "k"})
-
-local function cleanText(text)
-    return (tostring(text):gsub("<[^>]*>", ""):gsub("_", " "):gsub("^%s+", ""):gsub("%s+$", ""))
-end
-
-local function textSnapshot(root)
-    local result = {}
-    for _, node in ipairs(root:GetDescendants()) do
-        if node:IsA("TextLabel") or node:IsA("TextButton") then
-            result[node] = {text = cleanText(node.Text), shown = visible(node)}
-        end
-    end
-    return result
-end
-
-local function chooseTooltip(before, after)
-    local best, bestScore, ambiguous = nil, 0, false
-    for node, entry in pairs(after) do
-        local old = before[node]
-        local changed = not old or not old.shown or old.text ~= entry.text
-        local text = entry.text
-        if entry.shown and changed and text ~= "" and #text <= 100 and not text:find("\n")
-            and not parseNumber(text) then
-            local key = node.Name:lower()
-            local score = 0
-            -- Accept named title fields, not arbitrary changed stats/descriptions.
-            if key == "title" or key == "name" or key == "itemname" or key == "rewardname" then score = 10 end
-            local parent = node.Parent
-            while parent do
-                local name = parent.Name:lower()
-                if name:find("tooltip", 1, true) or name == "hover" then
-                    if key ~= "description" and key ~= "quantity" then score = score + 5 end
-                    break
-                end
-                parent = parent.Parent
-            end
-            if key == "description" or key == "quantity" or key == "amount" then score = 0 end
-            if score > bestScore then
-                best, bestScore, ambiguous = text, score, false
-            elseif score > 0 and score == bestScore and text ~= best then
-                ambiguous = true
+local function upgradeAll(player, interface, equipment, values)
+    local topbar = require(ReplicatedStorage.Modules["User Interface"].Topbar)
+    local function currency(name)
+        -- Topbar keeps the exact balance in New while the display animates.
+        for _, entry in pairs(topbar.Objects) do
+            if entry.Module == "Topbar" and entry.Currency == name and entry.Object then
+                local amount = entry.Object:GetAttribute("New")
+                if type(amount) == "number" and amount >= 0 then return amount end
             end
         end
+        local label = findPath(interface, {"Topbar", "Main", "Currencies", name, "Amount"})
+        local text = label and label.Text:gsub("<[^>]*>", ""):gsub(",", ""):gsub("%s", "")
+        -- Do not treat abbreviated amounts such as 1.2M as an exact balance.
+        if text and text:match("^%d+$") then return tonumber(text) end
     end
-    if not ambiguous then return best end
-end
-
-local function fireHover(frame, eventName)
-    if type(getconnections) ~= "function" then return false end
-    local ok, connections = pcall(function() return getconnections(frame[eventName]) end)
-    if not ok then return false end
-    local fired = false
-    for _, connection in ipairs(connections) do
-        local success = pcall(function() connection:Fire() end)
-        fired = fired or success
-    end
-    return fired
-end
-
--- Compatibility with the supplied script: last qualifying Interface label.
--- This is a heuristic, not proof that the selected label is an item name.
-local function legacyHoverName(interface)
-    if not interface then return nil end
-    local name
-    for _, node in ipairs(interface:GetDescendants()) do
-        if node:IsA("TextLabel") and node.Name ~= "Quantity" then
-            local text = cleanText(node.Text)
-            if text ~= "" and text ~= "OBTAINED" and text ~= "STATS" and text ~= "MISSION COMPLETED" then
-                name = text
-            end
-        end
-    end
-    return name
-end
-
-local function readHoverNames(items, main)
-    local root = player:FindFirstChild("PlayerGui")
-    if not root then return end
-    for _, item in ipairs(items:GetChildren()) do
-        if env.RewardsWebhookWatcher ~= watcher or not visible(main) then return end
-        local frame = item:FindFirstChild("Main")
-        local icon = childPath(item, {"Main", "Inner", "Icon"})
-        local cached = hoverNames[item]
-        if frame and (not cached or cached.icon ~= (icon and icon.Image)) then
-            -- Shared tooltip: hover/read each tile in a single fast pass.
-            fireHover(frame, "MouseLeave")
-            local name
-            local ok = pcall(function()
-                if not fireHover(frame, "MouseEnter") then return end
-                task.wait(0.02)
-                if not visible(main) then return end
-                name = legacyHoverName(root:FindFirstChild("Interface"))
-            end)
-            fireHover(frame, "MouseLeave")
-            if ok and name then
-                hoverNames[item] = {icon = icon and icon.Image, name = name}
-                print("[WEBHOOK] Hover " .. item.Name .. " -> " .. name)
-            else
-                warn("[WEBHOOK] Chua doc duoc tooltip cua " .. item.Name .. "; can kiem tra Effects.Hover / getconnections.")
-            end
-        end
-    end
-end
-
-local function formatItemName(name)
-    local text = cleanText(name):lower()
-    return (text:gsub("%a", string.upper, 1))
-end
-
-local function snapshot(items)
-    local rows, keys, goldReward, gemsReward = {}, {}, nil, nil
-    for _, item in ipairs(items:GetChildren()) do
-        if item:IsA("GuiObject") then
-            local inner = childPath(item, {"Main", "Inner"})
-            if inner then
-                local quantity = inner:FindFirstChild("Quantity")
-                local icon = inner:FindFirstChild("Icon")
-                local amount = quantity and quantity.Text or "1"
-                local name = item:GetAttribute("ItemName") or item:GetAttribute("RewardName")
-                local cached = hoverNames[item]
-                if cached and cached.icon == (icon and icon.Image) then name = cached.name end
-                if type(name) ~= "string" or name == "" then name = "Chua ro ten [" .. item.Name .. "]" end
-                local number = parseNumber(amount)
-                if cleanText(name):lower() == "gold" and number then goldReward = (goldReward or 0) + number end
-                if cleanText(name):lower() == "gems" and number then gemsReward = (gemsReward or 0) + number end
-                rows[#rows + 1] = "+" .. (number and formatNumber(number) or tostring(amount)) .. " " .. formatItemName(name)
-                keys[#keys + 1] = item.Name .. ":" .. tostring(amount) .. ":" .. tostring(icon and icon.Image)
-            end
-        end
-    end
-    table.sort(rows)
-    table.sort(keys)
-    return rows, table.concat(keys, "|"), goldReward, gemsReward
-end
-
--- Place IDs from Loading_Screen, scoped by universe (GameId).
-local mapPlaces = {
-    [4658598196] = {
-        [13379349730] = "Shiganshina", [14012874501] = "Trost", [14638336319] = "Forest",
-        [13904207646] = "Outskirts", [15220308770] = "Utgard", [17688739434] = "Docks",
-        [15824912319] = "Stohess", [126678335159530] = "Chapel", [112374853034490] = "Training",
-        [14916516914] = "Town Central", [14932214603] = "Trade Central", [13379208636] = "Menu",
-    },
-    [5310627045] = {
-        [17373821193] = "Shiganshina", [15393230324] = "Trost", [17373828240] = "Forest",
-        [17373824844] = "Outskirts", [18182863694] = "Utgard", [110415968652032] = "Docks",
-        [139092911630535] = "Stohess", [133979984250876] = "Chapel", [85939958627504] = "Training",
-        [15393230099] = "Town Central", [108309021405580] = "Trade Central", [15393224326] = "Menu",
-    },
-}
-
-local function matchDetails(stateText)
-    local maps = mapPlaces[game.GameId]
-    local map = maps and maps[game.PlaceId] or "Place " .. tostring(game.PlaceId)
-    local world = game:GetService("Workspace")
-    local mode = world:GetAttribute("Type")
-    local difficulty = world:GetAttribute("Difficulty")
-    local lines = {"Map: " .. map}
-    lines[#lines + 1] = "Mode: " .. (type(mode) == "string" and mode ~= "" and mode:gsub("_", " ") or "Chua xac dinh")
-    if type(difficulty) == "string" and difficulty ~= "" then
-        lines[#lines + 1] = "Difficulty: " .. difficulty:gsub("_", " ")
-    end
-    if stateText and stateText ~= "" then lines[#lines + 1] = stateText end
-    return table.concat(lines, "\n")
-end
-
-local function makeFields(interface, main, rows, goldSummary)
-    local fields = {}
-    local state = childPath(main, {"Info", "State"})
-    if state and state.Text ~= "" then
-        fields[#fields + 1] = {name = "Results", value = matchDetails(state.Text), inline = false}
-    end
-    for _, stat in ipairs({"Time_Taken", "Damage", "Kills", "Crits"}) do
-        local amount = childPath(main, {"Info", "Main", "Stats", stat, "Amount"})
-        if amount and amount.Text ~= "" then
-            fields[#fields + 1] = {name = stat:gsub("_", " "), value = amount.Text, inline = true}
-        end
-    end
-    for _, currency in ipairs({"Gold", "Gems"}) do
-        local amount = childPath(interface, {"Topbar", "Main", "Currencies", currency, "Amount"})
-        local number = amount and parseNumber(amount.Text)
-        if number and not goldSummary then fields[#fields + 1] = {name = currency .. " (UI)", value = formatNumber(number), inline = true} end
-    end
-    local parts, length = {}, 0
-    for _, row in ipairs(rows) do
-        if goldSummary and row:match("^%+[%d,]+ Gold$") then
-            row = goldSummary.line or row
-        end
-        if goldSummary and row:match("^%+[%d,]+ Gems$") then
-            row = goldSummary.gemsLine or row
-        end
-        if length + #row + 1 > 850 then
-            parts[#parts + 1] = "... danh sach da rut gon"
-            break
-        end
-        parts[#parts + 1], length = row, length + #row + 1
-    end
-    fields[#fields + 1] = {name = "Rewards", value = #parts > 0 and table.concat(parts, "\n") or "Khong co item tren UI.", inline = false}
-    return fields
-end
-
-local function send(fields)
-    if not app.webhook then return false, "Webhook disabled", 1 end
-    local requestCall = request or http_request
-    if type(requestCall) ~= "function" and type(syn) == "table" then requestCall = syn.request end
-    if type(requestCall) ~= "function" and type(http) == "table" then requestCall = http.request end
-    if type(requestCall) ~= "function" then return false, "Executor khong co ham HTTP request", 15 end
-    if (app.url or WEBHOOK_URL) == "" or (app.url or WEBHOOK_URL):find("URL_WEBHOOK", 1, true) then return false, "Chua dien WEBHOOK_URL", 30 end
-    local ok, response = pcall(function()
-        return requestCall({
-            Url = app.url or WEBHOOK_URL, Method = "POST", Headers = {["Content-Type"] = "application/json"},
-            Body = HttpService:JSONEncode({
-                allowed_mentions = {parse = {}},
-                embeds = {{title = "Attack on titan revolution - " .. player.Name, color = 65280,
-                    fields = fields, timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ")}},
-            }),
-        })
-    end)
-    if not ok then return false, "Ham HTTP request nem loi (an URL/token)", 10 end
-    if type(response) ~= "table" then return false, "Khong nhan duoc HTTP response", 10 end
-    local status = tonumber(response.StatusCode or response.Status)
-    if status and status >= 200 and status < 300 then return true end
-    local delay = 10
-    if status == 429 then
-        local decoded, body = pcall(function() return HttpService:JSONDecode(response.Body or "") end)
-        if decoded and type(body) == "table" then delay = math.max(1, tonumber(body.retry_after) or 10) end
-    end
-    return false, "Discord HTTP " .. tostring(status or "unknown"), delay
-end
-
-webhookSend = send
-webhookDetails = matchDetails
-webhookBalance = function() return goldLedger.balance, goldLedger.gems end
-print("[WEBHOOK] Client da chay; cho ket thuc tran / Rewards.")
-task.spawn(function()
-    local active, sent, fingerprint, changedAt, openedAt, hiddenAt
-    local matchId, matchBase, gemsBase, goldSummary
-    local attempts, nextTry, lastError = 0, 0, -10
-    while env.RewardsWebhookWatcher == watcher do
-        task.wait(0.1)
-        local ok = pcall(function()
-            local interface = childPath(player, {"PlayerGui", "Interface"})
-            local main = childPath(interface, {"Rewards", "Main"})
-            local now = os.clock()
-            if not visible(main) then
-                captureLobbyGold(interface)
-                app.goldBalance = goldLedger.balance
-                hiddenAt = hiddenAt or now
-                if now - hiddenAt >= 1 then active = nil end
-                return
-            end
-            hiddenAt = nil
-            if active ~= main then
-                active, sent, fingerprint = main, false, nil
-                openedAt, changedAt, attempts, nextTry = now, now, 0, 0
-                matchId = tostring(game.JobId) .. ":" .. tostring(os.time()) .. ":" .. tostring(now)
-                matchBase, goldSummary = goldLedger.balance, nil
-                gemsBase = goldLedger.gems
-                print("[WEBHOOK] Da thay Rewards; cho du lieu tran.")
-            end
-            if sent or attempts >= 5 or now < nextTry then return end
-            local items = childPath(main, {"Info", "Main", "Items"})
-            local state = childPath(main, {"Info", "State"})
-            if not items or not state or state.Text == "" then return end
-            local rows, key = snapshot(items)
-            key = state.Text .. "|" .. key
-            if key ~= fingerprint then fingerprint, changedAt = key, now end
-            if now - openedAt < 0.4 or now - changedAt < 0.2 then return end
-            if #rows == 0 and now - openedAt < 2 then return end
-            readHoverNames(items, main)
-            if env.RewardsWebhookWatcher ~= watcher or not visible(main) then return end
-            local currentKey, goldReward, gemsReward
-            rows, currentKey, goldReward, gemsReward = snapshot(items)
-            if state.Text .. "|" .. currentKey ~= key then
-                fingerprint, changedAt = nil, os.clock()
-                return
-            end
-            if not goldSummary then
-                if validBalance(matchBase) and goldReward then
-                    goldSummary = {line = "+" .. formatNumber(goldReward)
-                        .. " (" .. formatNumber(matchBase + goldReward) .. ")"}
-                else
-                    goldSummary = {}
-                end
-                if validBalance(gemsBase) and gemsReward then
-                    goldSummary.gemsLine = "+" .. formatNumber(gemsReward)
-                        .. " (" .. formatNumber(gemsBase + gemsReward) .. ")"
-                end
-                -- Update once even if Discord fails, so retry cannot double count.
-                if goldReward then applyGoldReward(matchId, goldReward) end
-                if gemsReward then applyGemsReward(matchId, gemsReward) end
-            end
-            app.goldBalance = goldLedger.balance
-            if not app.webhook then sent = true; return end
-            attempts = attempts + 1
-            local success, reason, delay = send(makeFields(interface, main, rows, goldSummary))
-            if success then
-                sent = true
-                print("[WEBHOOK] Da gui ket qua tran thanh cong (HTTP 2xx).")
-            else
-                warn("[WEBHOOK] " .. reason .. " - lan " .. attempts .. "/5")
-                nextTry = os.clock() + delay
-            end
-        end)
-        if not ok and os.clock() - lastError >= 5 then
-            lastError = os.clock()
-            warn("[WEBHOOK] Loi doc PlayerGui; dang thu lai.")
-        end
-    end
-end)
-end
-task.spawn(function()
-local Players = game:GetService("Players")
-local player = Players.LocalPlayer
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local VirtualInputManager = game:GetService("VirtualInputManager")
--- Wait without blocking PPHud or the lobby currency tracker.
-local titans
-repeat
-    titans = workspace:FindFirstChild("Titans")
-    if not titans then task.wait(0.5) end
-until titans or not app.running
-if not app.running then return end
-local GET = automationRemote("GET")
-local retryEvent = GET and GET:IsA("RemoteFunction") and GET or nil
-
--- ================= KHẮC PHỤC LỖI KẸT CHUỘT KHI CHẾT / RESET =================
-connections[#connections + 1] = player.CharacterAdded:Connect(function(newChar)
-    local root = newChar:WaitForChild("HumanoidRootPart", 5)
-    if root then
-        root.Anchored = false
-    end
-    -- Đảm bảo mở khóa chuột khi chết/hồi sinh
-    pcall(function()
-        game:GetService("UserInputService").MouseBehavior = Enum.MouseBehavior.Default
-    end)
-end)
-
-
-task.spawn(function()
-    local wasVisible = false
-    while app.running do
-        task.wait(0.1)
-        local interface = player.PlayerGui:FindFirstChild("Interface")
-        local rewards = interface and interface:FindFirstChild("Rewards")
-        local main = rewards and rewards:FindFirstChild("Main")
-        local shown = main ~= nil
-        local node = main
-        while node and node ~= game do
-            if node:IsA("GuiObject") and not node.Visible then shown = false end
-            if node:IsA("CanvasGroup") and node.GroupTransparency >= 0.99 then shown = false end
-            if node:IsA("ScreenGui") and not node.Enabled then shown = false end
-            node = node.Parent
-        end
-        if shown and not wasVisible and app.retry and not app.shouldLeave() then
-            wasVisible = true
-            task.wait(0.5)
-            if app.running and app.retry and retryEvent and not app.shouldLeave() then
-                pcall(function() retryEvent:InvokeServer("Functions", "Retry", "Add") end)
-            end
-        elseif not shown then wasVisible = false end
-    end
-end)
-local function getNape(titan)
-    local hitboxes = titan:FindFirstChild("Hitboxes")
-    if hitboxes then
-        local hit = hitboxes:FindFirstChild("Hit")
-        if hit then
-            local nape = hit:FindFirstChild("Nape")
-            if nape then return nape end
-        end
-    end
-    return titan:FindFirstChild("Nape", true)
-end
-
-local function getBladeStatus()
-    local character = player.Character
-    local characters = game.Workspace:FindFirstChild("Characters")
-    local rig = character and characters and characters:FindFirstChild(character.Name)
-    -- Unknown state is not proof the blades are empty.
-    if not rig then return nil, nil end
-    local setsLeft, segmentsLeft = 0, 0
-    for i = 1, 3 do
-        local bladeSet = rig:FindFirstChild("Left_" .. i, true)
-        if bladeSet and bladeSet:GetAttribute("Used") == nil then setsLeft = setsLeft + 1 end
-    end
-    local seen = {}
-    for _, part in ipairs(rig:GetDescendants()) do
-        if part:IsA("BasePart") then
-            local index = tonumber(part.Name:match("^Blade_(%d+)$"))
-            if index and index >= 1 and index <= 7 and not seen[index]
-                and part:GetAttribute("Broken") == nil and part.Transparency < 1 then
-                seen[index] = true
-                segmentsLeft = segmentsLeft + 1
-            end
-        end
-    end
-    return setsLeft, segmentsLeft
-end
-
-local function getRefillPart()
-    local node = game.Workspace:FindFirstChild("Unclimbable")
-    node = node and node:FindFirstChild("Props")
-    local hq = node and node:FindFirstChild("HQ")
-    if not hq then return nil end
-    for _, child in ipairs(hq:GetChildren()) do
-        local tanks = child:FindFirstChild("GasTanks") or (child.Name == "GasTanks" and child)
-        local refill = tanks and tanks:FindFirstChild("Refill", true)
-        if refill and refill:IsA("BasePart") then return refill end
-    end
-end
-
-local function refillBlades(character, root)
-    local station = getRefillPart()
-    local assets = ReplicatedStorage:FindFirstChild("Assets")
-    local remotes = assets and assets:FindFirstChild("Remotes")
-    local post = remotes and remotes:FindFirstChild("POST")
-    if not station or not post or not post:IsA("RemoteEvent") then
-        task.wait(0.5)
+    local gold, gems = currency("Gold"), currency("Gems")
+    print("[AUTO PRESTIGE] Gold: " .. tostring(gold) .. " | Gems: " .. tostring(gems))
+    local blades = findPath(equipment, {"Stats", "Blades"})
+    if not blades or not isVisible(blades) then
+        print("[AUTO PRESTIGE] Blades upgrades not active; continuing step 2.")
         return
     end
-    local oldCF = root.CFrame
-    local function valid()
-        return app.farm and player.Character == character and root.Parent == character
-    end
-    root.Anchored = false
-    local ok = pcall(function()
-        root.CFrame = station.CFrame + Vector3.new(0, 3, 0)
-        root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+    -- Let the game's Upgrade All handler decide which upgrades are affordable.
+    -- Stop if Gold does not decrease; never keep clicking a refused purchase.
+    for _ = 1, 120 do
+        gold = currency("Gold")
+        if not gold or gold <= 0 then
+            print("[AUTO PRESTIGE] No available Gold balance; continuing step 2.")
+            return
+        end
+        local all = findPath(equipment, {"Stats", "All"})
+        if not all or not isVisible(all) then
+            print("[AUTO PRESTIGE] Upgrade All unavailable; continuing step 2.")
+            return
+        end
+        local previousGold = gold
+        print("[AUTO PRESTIGE] Clicking Upgrade All. Gold: " .. gold)
+        click(all:IsA("GuiButton") and all or awaitPath(all, {"Interact"}))
         task.wait(1)
-        if not valid() then return end
-        post:FireServer("Attacks", "Reload", station)
-        task.wait(0.5)
-    end)
-    if valid() then
-        root.CFrame = oldCF
-        root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
-        -- Cooldown stays inside the farm loop: no tween/attacks during refill.
-        local deadline = os.clock() + 5
-        while valid() and os.clock() < deadline do task.wait(0.1) end
+        local deadline = os.clock() + 8
+        repeat
+            gold = currency("Gold")
+            if gold and gold < previousGold then break end
+            task.wait(0.25)
+        until os.clock() >= deadline
+        if not gold or gold >= previousGold then
+            print("[AUTO PRESTIGE] Gold did not decrease (insufficient Gold or no upgrade); continuing step 2.")
+            return
+        end
+        print("[AUTO PRESTIGE] Gold remaining: " .. gold .. " | Gems: " .. tostring(currency("Gems")))
     end
-    if not ok then warn("[REFILL] Reload failed; will retry after cooldown.") end
 end
 
-local function isCurrentBladeBroken()
-    if not player.Character then return false end
-    local rig = game.Workspace:FindFirstChild("Rig_" .. player.Character.Name, true)
-    if not rig then rig = player.Character end
-    
-    local leftHand = rig:FindFirstChild("LeftHand", true)
-    if leftHand then
-        local currentBlade = leftHand:FindFirstChild("Blade_1")
-        if currentBlade and currentBlade:GetAttribute("Broken") == true then
-            return true
+local function readDifficulty(player)
+    local gui = awaitPath(player, {"PlayerGui"})
+    local interface = awaitPath(gui, {"Interface"})
+    local equipment = awaitPath(interface, {"Equipment"})
+    -- Avoid toggling an already-open Equipment menu closed on a rerun.
+    if not isVisible(equipment) then
+        click(awaitPath(interface, {"Topbar", "Main", "Categories", "Equipment", "Interact"}))
+        task.wait(1)
+    end
+    click(awaitPath(equipment, {"Categories", "Upgrades", "Main", "Interact"}))
+    task.wait(1)
+
+    local values = require(ReplicatedStorage.Modules.Storage.Values)
+    local upgraded, upgradeError = pcall(upgradeAll, player, interface, equipment, values)
+    if not upgraded then
+        warn("[AUTO PRESTIGE] Upgrade stopped; continuing step 2: " .. tostring(upgradeError))
+    end
+    local gradeIndex, grade
+    local found = waitForValue(function()
+        local title = findPath(equipment, {"Categories", "Upgrades", "Main", "Title"})
+        if not title then return nil end
+        local text = title.Text:gsub("<[^>]*>", ""):upper()
+        grade = text:match("%[([A-S][%+%-]?)%s+GRADE%]")
+            or text:match("%[GRADE%s+([A-S][%+%-]?)%]")
+        for index, tag in pairs(values.Pot_Tags) do
+            if tag == grade then gradeIndex = index; return true end
+        end
+    end)
+    assert(found, "Could not read Equipment Grade.")
+
+    -- Highest unlocked Missions difficulty; Freedom additionally needs Prestige 3.
+    -- The live slot Prestige is unavailable here, so do not infer it from Grade.
+    local difficulty
+    local prestige = player:GetAttribute("Prestige")
+    for _, requirement in ipairs(values.Difficulty_Potential.Missions) do
+        if gradeIndex >= requirement[2]
+            and (requirement[1] ~= "Freedom" or (type(prestige) == "number" and prestige >= 3)) then
+            difficulty = requirement[1]
         end
     end
-    return false
+    assert(difficulty, "No eligible difficulty for Grade " .. tostring(grade))
+    print("[AUTO PRESTIGE] Step 1.5: Grade " .. grade .. " -> " .. difficulty)
+    return difficulty
 end
 
--- Minigame Code (Quét mỗi 0.5 giây)
-local keyMap = {
-    ["W"] = Enum.KeyCode.W,
-    ["A"] = Enum.KeyCode.A,
-    ["S"] = Enum.KeyCode.S,
-    ["D"] = Enum.KeyCode.D,
-}
+local function startMission(player, difficulty)
+    local remote = awaitPath(ReplicatedStorage, {"Assets", "Remotes", "GET"})
+    local config = {Name = "Shiganshina", Type = "Missions", Objective = "Breach", Difficulty = difficulty}
+    local function matches(candidate)
+        if typeof(candidate) ~= "Instance" or not candidate.Parent
+            or not candidate:IsA("StringValue") or candidate.Name ~= config.Name then return false end
+        local leader = candidate:FindFirstChild("Leader")
+        return leader and leader.Value == player.Name and candidate.Value == config.Difficulty
+            and candidate:GetAttribute("Type") == config.Type
+            and candidate:GetAttribute("Objective") == config.Objective
+    end
+    local function findMission()
+        local folder = ReplicatedStorage:FindFirstChild("Missions")
+        local found
+        if folder then
+            for _, candidate in ipairs(folder:GetChildren()) do
+                if matches(candidate) then
+                    assert(not found, "Multiple matching missions; disband duplicates first.")
+                    found = candidate
+                else
+                    local leader = candidate:FindFirstChild("Leader")
+                    assert(not leader or leader.Value ~= player.Name,
+                        "You lead another mission; disband it before running.")
+                end
+            end
+        end
+        return found
+    end
+    local mission = findMission()
+    if not mission then
+        print("[AUTO PRESTIGE] Step 2: creating Shiganshina / Breach / " .. difficulty)
+        remote:InvokeServer("S_Missions", "Create", config)
+        mission = waitForValue(findMission)
+    end
+    assert(mission, "Mission did not replicate; check party and difficulty unlocks.")
+    local wanted = {"No Perks", "No Skills", "No Memories", "Nightmare", "Injury Prone",
+        "Chronic Injuries", "Fog", "Glass Cannon", "Time Trial", "Fatigue", "Evolution"}
+    local excluded = {"Oddball", "Boring", "Simple", "Primitive"}
+    local function enabled(name)
+        assert(matches(mission), "Mission changed or you are no longer leader.")
+        local state = mission:GetAttribute("Modifiers")
+        assert(type(state) == "string", "Modifiers attribute is not ready.")
+        return state:find(name, 1, true) ~= nil
+    end
+    assert(waitForValue(function() return type(mission:GetAttribute("Modifiers")) == "string" end),
+        "Modifiers did not load.")
+    local function setModifier(name, target)
+        if enabled(name) == target then return end
+        print("[AUTO PRESTIGE] " .. (target and "Enable: " or "Disable: ") .. name)
+        remote:InvokeServer("S_Missions", "Modify", name)
+        local deadline = os.clock() + 8
+        repeat
+            task.wait(0.2)
+            if enabled(name) == target then task.wait(0.5); return end
+        until os.clock() >= deadline
+        -- Modify toggles state; never blindly retry a delayed request.
+        error("Modifier not confirmed: " .. name .. " | " .. tostring(mission:GetAttribute("Modifiers")))
+    end
+    for _, name in ipairs(excluded) do setModifier(name, false) end
+    for _, name in ipairs(wanted) do setModifier(name, true) end
+    task.wait(1)
+    for _, name in ipairs(excluded) do assert(not enabled(name), "Excluded modifier enabled: " .. name) end
+    for _, name in ipairs(wanted) do assert(enabled(name), "Missing modifier: " .. name) end
+    print("[AUTO PRESTIGE] Step 2: confirmed 11 modifiers; requesting Start.")
+    remote:InvokeServer("S_Missions", "Start")
+    print("[AUTO PRESTIGE] Start requested.")
+end
 
-task.spawn(function()
-    while app.running do
-        task.wait(0.1)
-        if app.farm then
+local function startMissionFarm()
+    local env = type(getgenv) == "function" and getgenv() or _G
+    if env.AutoPrestigeFarm and env.AutoPrestigeFarm.stop then env.AutoPrestigeFarm.stop() end
+    local player = waitForValue(function() return Players.LocalPlayer end)
+    assert(player, "LocalPlayer did not load for Auto Farm.")
+    local input = game:GetService("VirtualInputManager")
+    local tweenService = game:GetService("TweenService")
+    local farm = {running = true, connections = {}}
+    env.AutoPrestigeFarm = farm
+    local function active()
+        local timer = env.AutoPrestigeLobbyTimer
+        return farm.running and env.AutoPrestigeFarm == farm and inMission()
+            and not (timer and (timer.leaving or os.clock() >= timer.deadline))
+    end
+    local function release()
+        if farm.tween then farm.tween:Cancel(); farm.tween = nil end
+        local root = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+        if root then root.Anchored = false end
+        pcall(function() game:GetService("UserInputService").MouseBehavior = Enum.MouseBehavior.Default end)
+    end
+    function farm.stop()
+        farm.running = false
+        release()
+        for _, connection in ipairs(farm.connections) do connection:Disconnect() end
+        farm.connections = {}
+    end
+    stopMissionFarm = farm.stop
+    local function remote(name)
+        local assets = ReplicatedStorage:FindFirstChild("Assets")
+        local remotes = assets and assets:FindFirstChild("Remotes")
+        return remotes and remotes:FindFirstChild(name)
+    end
+    local function path(root, names) return findPath(root, names) end
+    farm.connections[#farm.connections + 1] = player.CharacterAdded:Connect(function(character)
+        release()
+        local root = character:WaitForChild("HumanoidRootPart", 5)
+        if root then root.Anchored = false end
+    end)
+    local function key(code)
+        input:SendKeyEvent(true, code, false, game)
+        task.wait(0.05)
+        input:SendKeyEvent(false, code, false, game)
+    end
+    -- One Retry request per visible Rewards screen; never retry while leaving.
+    task.spawn(function()
+        local wasVisible = false
+        while active() do
+            task.wait(0.1)
+            local main = path(player, {"PlayerGui", "Interface", "Rewards", "Main"})
+            local shown = main and isVisible(main) or false
+            if shown and not wasVisible then
+                wasVisible = true
+                task.wait(0.5)
+                if active() and main.Parent and isVisible(main) then
+                    local get = remote("GET")
+                    if get and get:IsA("RemoteFunction") then
+                        local ok, err = pcall(function() get:InvokeServer("Functions", "Retry", "Add") end)
+                        if not ok then warn("[AUTO PRESTIGE] Retry failed: " .. tostring(err)) end
+                    end
+                end
+            elseif not shown then wasVisible = false end
+        end
+    end)
+    task.spawn(function()
+        local keys = {W = Enum.KeyCode.W, A = Enum.KeyCode.A, S = Enum.KeyCode.S, D = Enum.KeyCode.D}
+        while active() do
+            task.wait(0.1)
             pcall(function()
-                local playerGui = player:FindFirstChild("PlayerGui")
-                if playerGui then
-                    for _, descendant in pairs(playerGui:GetDescendants()) do
-                        if descendant.Name == "Key" and descendant:IsA("TextLabel") and descendant.Visible then
-                            local keyText = string.upper(descendant.Text)
-                            local keyCode = keyMap[keyText]
-                            if keyCode then
-                                VirtualInputManager:SendKeyEvent(true, keyCode, false, game)
-                                task.wait(0.05)
-                                VirtualInputManager:SendKeyEvent(false, keyCode, false, game)
-                            end
-                        end
+                local gui = player:FindFirstChild("PlayerGui")
+                if not gui then return end
+                for _, label in ipairs(gui:GetDescendants()) do
+                    if not active() then return end
+                    if label.Name == "Key" and label:IsA("TextLabel") and isVisible(label) then
+                        local code = keys[label.Text:upper()]
+                        if code then key(code) end
                     end
                 end
             end)
         end
+    end)
+    local function rig(character)
+        return workspace:FindFirstChild("Rig_" .. character.Name, true) or character
     end
-end)
-
-local function getTarget()
-    if not player.Character then return end
-    local root = player.Character:FindFirstChild("HumanoidRootPart")
-    if not root then return end
-
-    local target, nape
-    local distance = math.huge
-
-    for _, titan in titans:GetChildren() do
-        if titan:IsA("Model") then
-            local hum = titan:FindFirstChild("Humanoid")
-            local neck = getNape(titan)
-
-            if hum and hum.Health > 0 and neck and neck:IsA("BasePart") then
-                local mag = (root.Position - neck.Position).Magnitude
-                if mag < distance then
-                    distance = mag
-                    target = titan
-                    nape = neck
+    local function bladeSets(character)
+        local model, count = rig(character), 0
+        for index = 1, 3 do
+            local set = model:FindFirstChild("Left_" .. index, true)
+            if not set or set:GetAttribute("Used") == nil then count = count + 1 end
+        end
+        return count
+    end
+    local function napeOf(titan)
+        return path(titan, {"Hitboxes", "Hit", "Nape"}) or titan:FindFirstChild("Nape", true)
+    end
+    local function iteration()
+        local character = player.Character
+        local root = character and character:FindFirstChild("HumanoidRootPart")
+        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+        if not root or not humanoid or humanoid.Health <= 0 then release(); task.wait(0.5); return end
+        local function valid()
+            return active() and player.Character == character and root.Parent == character and humanoid.Health > 0
+        end
+        if bladeSets(character) <= 0 then
+            release()
+            local station, nearest = nil, math.huge
+            for _, part in ipairs(workspace:GetDescendants()) do
+                if part.Name == "Refill" and part:IsA("BasePart") then
+                    local distance = (root.Position - part.Position).Magnitude
+                    if distance < nearest then station, nearest = part, distance end
+                end
+            end
+            if station and valid() then
+                root.CFrame = station.CFrame * CFrame.new(0, 3, 0)
+                task.wait(0.3)
+                if not valid() then return end
+                local post, get = remote("POST"), remote("GET")
+                if post then post:FireServer("Attacks", "Reload", station) end
+                if get then get:InvokeServer("Blades", "Reload") end
+                task.wait(1.5)
+            else task.wait(0.5) end
+            return
+        end
+        local titans = workspace:FindFirstChild("Titans")
+        local target, nape, nearest = nil, nil, math.huge
+        if titans then
+            for _, titan in ipairs(titans:GetChildren()) do
+                local hum = titan:IsA("Model") and titan:FindFirstChild("Humanoid")
+                local neck = hum and napeOf(titan)
+                if hum and hum.Health > 0 and neck and neck:IsA("BasePart") then
+                    local distance = (root.Position - neck.Position).Magnitude
+                    if distance < nearest then target, nape, nearest = titan, neck, distance end
                 end
             end
         end
-    end
-
-    return target, nape
-end
-
-while app.running do
-    task.wait()
-
-    if not app.running or not app.farm then
-        continue
-    end
-
-    if not player.Character then
-        task.wait(1)
-        continue
-    end
-
-    local root = player.Character:FindFirstChild("HumanoidRootPart")
-    local humanoid = player.Character:FindFirstChildOfClass("Humanoid")
-    if not root or not humanoid or humanoid.Health <= 0 then
-        task.wait(1)
-        continue
-    end
-
-    local setsLeft, segmentsLeft = getBladeStatus()
-    if setsLeft == nil then task.wait(0.5); continue end
-    if setsLeft == 0 and segmentsLeft == 0 then
-        refillBlades(player.Character, root)
-        continue
-    end
-
-    local titan, nape = getTarget()
-    if not titan or not nape then
-        root.Anchored = false
-        task.wait(0.5)
-        continue
-    end
-
-    local hum = titan:FindFirstChild("Humanoid")
-
-    while app.running and hum and hum.Health > 0 do
-        if not app.running or not app.farm then 
-            root.Anchored = false
-            break 
-        end
-        if not player.Character then break end
-        root = player.Character:FindFirstChild("HumanoidRootPart")
-        humanoid = player.Character:FindFirstChildOfClass("Humanoid")
-        if not root or not humanoid or humanoid.Health <= 0 then 
-            if root then root.Anchored = false end
-            break 
-        end
-
-        local curSets, curSegments = getBladeStatus()
-        if curSets == nil or (curSets == 0 and curSegments == 0) then
-            root.Anchored = false
-            break
-        end
-
-        if not nape or not nape.Parent then
-            nape = getNape(titan)
-        end
-        if not nape then 
-            root.Anchored = false
-            break 
-        end
-
-       if isCurrentBladeBroken() then
-            -- Giữ nhân vật đứng yên trên không trung để không bị rớt xuống khi bấm R đổi kiếm
+        if not target then release(); task.wait(0.5); return end
+        local hand = rig(character):FindFirstChild("LeftHand", true)
+        local blade = hand and hand:FindFirstChild("Blade_1")
+        if blade and blade:GetAttribute("Broken") == true then
             root.Anchored = true
-            
-            VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.R, false, game)
-            task.wait(0.05)
-            VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.R, false, game)
-            
-            -- Chờ hoạt ảnh thay kiếm hoàn tất (0.6s như cũ) nhưng nhân vật vẫn được giữ trên không
+            key(Enum.KeyCode.R)
             task.wait(0.6)
-            
-            -- Mở khóa lại để tiếp tục Tween tới Titan
             root.Anchored = false
         end
-
+        if not valid() or not nape.Parent then return end
         root.Anchored = false
-        
-        -- ================= ĐIỀU CHỈNH VỊ TRÍ BAY (TWEEN) =================
-        -- Giữ nhân vật luôn ở trên cao so với gáy Titan (dù là Titan thường hay Titan bò sát đất)
-        -- Đảm bảo chiều cao tối thiểu so với mặt đất hoặc gáy để không bị cắm đầu xuống dưới.
-        local safeHeight = math.max(app.height, nape.Position.Y + 50)
-        local targetCFrame = CFrame.new(nape.Position.X, safeHeight, nape.Position.Z) * CFrame.new(0, 0, app.distance)
-        
-        local distance = (root.Position - targetCFrame.Position).Magnitude
-        local tweenTime = distance / app.speed
-        if tweenTime < 0.05 then tweenTime = 0.05 end
-
-        local tween = game.TweenService:Create(
-            root,
-            TweenInfo.new(tweenTime, Enum.EasingStyle.Linear),
-            {CFrame = targetCFrame}
-        )
-
-        activeTween = tween
+        local height = math.max(400, nape.Position.Y + 50)
+        local destination = CFrame.new(nape.Position.X, height, nape.Position.Z) * CFrame.new(0, 0, 2)
+        local duration = math.max(0.05, (root.Position - destination.Position).Magnitude / 300)
+        local tween = tweenService:Create(root, TweenInfo.new(duration, Enum.EasingStyle.Linear), {CFrame = destination})
+        farm.tween = tween
         tween:Play()
-        tween.Completed:Wait()
-        activeTween = nil
-        if not app.running or not app.farm then root.Anchored = false; break end
-
+        local started = os.clock()
+        while valid() and os.clock() - started < duration
+            and tween.PlaybackState == Enum.PlaybackState.Playing do task.wait(0.05) end
+        tween:Cancel()
+        if farm.tween == tween then farm.tween = nil end
+        if not valid() or not nape.Parent then release(); return end
         root.Anchored = true
-
-        -- ================= BỔ SUNG REGISTER & CLICK CHUỘT VÀO ĐÂY =================
-        local attackRemote = automationRemote("POST")
-        if attackRemote and attackRemote:IsA("RemoteEvent") then
-            pcall(function()
-                attackRemote:FireServer("Attacks", "Slash", true)
-                attackRemote:FireServer("Hitboxes", "Register", nape, math.random() * 0.1 + 0.05)
-                attackRemote:FireServer("Attacks", "Slash", false)
-            end)
+        local post = remote("POST")
+        if post then
+            post:FireServer("Attacks", "Slash", true)
+            post:FireServer("Hitboxes", "Register", nape, math.random() * 0.1 + 0.05)
+            post:FireServer("Attacks", "Slash", false)
         end
-        
-        -- Giả lập click chuột trái
-        pcall(function()
-            VirtualInputManager:SendMouseButtonEvent(0, 0, 0, true, game, 0)
-            task.wait(0.05)
-            VirtualInputManager:SendMouseButtonEvent(0, 0, 0, false, game, 0)
-        end)
-        -- =========================================================================
-
+        input:SendMouseButtonEvent(0, 0, 0, true, game, 0)
+        task.wait(0.05)
+        input:SendMouseButtonEvent(0, 0, 0, false, game, 0)
         task.wait(0.15)
-        hum = titan:FindFirstChild("Humanoid")
-    end
-    
-    if root then
         root.Anchored = false
     end
+    task.spawn(function()
+        while active() do
+            local ok, err = pcall(iteration)
+            if not ok then release(); warn("[AUTO PRESTIGE] Farm: " .. tostring(err)); task.wait(1) end
+            task.wait()
+        end
+        farm.stop()
+    end)
+    print("[AUTO PRESTIGE] Step 2.5: Auto Farm + Auto Retry enabled (no webhook/HUD).")
 end
+
+local ok, message = pcall(function()
+    if inMission() then
+        startLobbyTimer()
+        startMissionFarm()
+        return
+    end
+    if not selectLobby() then
+        print("[AUTO PRESTIGE] Re-run this file in Lobby after teleport to continue steps 1.5 and 2.")
+        return
+    end
+    local player = waitForValue(function() return Players.LocalPlayer end)
+    assert(player, "LocalPlayer did not load.")
+    local difficulty = readDifficulty(player)
+    startMission(player, difficulty)
 end)
+if not ok then warn("[AUTO PRESTIGE] Stopped: " .. tostring(message)) end
