@@ -1,4 +1,7 @@
-repeat task.wait(1) until game:IsLoaded()
+-- Auto prestige: Lobby setup, upgrades, 2.5 farm/retry, 3.0 Rewards webhook, timed return.
+-- Standalone: does not load or modify titan_pphud.luau.
+-- Re-run in Lobby after a place teleport; automatic reinjection is not installed.
+-- Step 1.5 spends Gold through the game's Upgrade All button; never spends Gems.
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 -- Autoexec may run before the client and game UI have initialized.
@@ -1002,18 +1005,8 @@ local function startMissionFarm()
         if farm.refillHold then farm.refillHold:Destroy(); farm.refillHold = nil end
     end
     local function holdBeforeRefill(root)
-        root.Anchored = false
-        if farm.refillHold and farm.refillHold.Parent ~= root then clearRefillHold() end
-        if not farm.refillHold then
-            local hold = Instance.new("BodyPosition")
-            hold.Name = "AutoPrestigePreRefillHold"
-            hold.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
-            hold.P = 30000
-            hold.D = 1500
-            hold.Position = root.Position
-            hold.Parent = root
-            farm.refillHold = hold
-        end
+        clearRefillHold()
+        root.Anchored = true
         root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
     end
     local function release()
@@ -1036,6 +1029,52 @@ local function startMissionFarm()
         return remotes and remotes:FindFirstChild(name)
     end
     local function path(root, names) return findPath(root, names) end
+    local function skipUI()
+        local ui = path(player, {"PlayerGui", "Interface", "Skip"})
+        if ui and isVisible(ui) then return ui end
+    end
+    local function canFarm()
+        return active() and not farm.cutscenePaused and not skipUI()
+    end
+    -- Step 2.7: use the game's Skip button, never a captured nil-instance DebugId.
+    task.spawn(function()
+        local clickedUI
+        while active() do
+            local ui = skipUI()
+            if ui then
+                if not farm.cutscenePaused then
+                    farm.cutscenePaused = true
+                    release()
+                    print("[AUTO PRESTIGE] Step 2.7: Skip UI visible; farm paused.")
+                end
+                if clickedUI ~= ui then
+                    local button = ui:IsA("GuiButton") and ui or nil
+                    if not button then
+                        for _, candidate in ipairs(ui:GetDescendants()) do
+                            if candidate:IsA("GuiButton") and isVisible(candidate) then
+                                button = candidate
+                                break
+                            end
+                        end
+                    end
+                    if button then
+                        clickedUI = ui
+                        local ok, err = pcall(click, button)
+                        if not ok then warn("[AUTO PRESTIGE] Skip click failed: " .. tostring(err)) end
+                    end
+                end
+            elseif farm.cutscenePaused then
+                clickedUI = nil
+                local resumeAt = os.clock() + 1
+                repeat task.wait(0.1) until not active() or skipUI() or os.clock() >= resumeAt
+                if active() and not skipUI() then
+                    farm.cutscenePaused = false
+                    print("[AUTO PRESTIGE] Step 2.7: Skip UI closed; farm resumed after 1 second.")
+                end
+            end
+            task.wait(0.1)
+        end
+    end)
     farm.connections[#farm.connections + 1] = player.CharacterAdded:Connect(function(character)
         release()
         local root = character:WaitForChild("HumanoidRootPart", 5)
@@ -1053,7 +1092,7 @@ local function startMissionFarm()
             task.wait(0.1)
             local main = path(player, {"PlayerGui", "Interface", "Rewards", "Main"})
             local shown = main and isVisible(main) or false
-            if shown and not wasVisible then
+            if shown and not wasVisible and canFarm() then
                 wasVisible = true
                 task.wait(0.5)
                 -- Give the Rewards tracker time to capture items before Retry hides the UI.
@@ -1064,7 +1103,7 @@ local function startMissionFarm()
                     if not watcher or watcher.readyMain == main then break end
                     task.wait(0.1)
                 end
-                if active() and main.Parent and isVisible(main) then
+                if canFarm() and main.Parent and isVisible(main) then
                     local timer = env.AutoPrestigeLobbyTimer
                     local plan = timer and timer.gradePlan
                     local watcher = env.AutoPrestigeRewardsWatcher
@@ -1091,7 +1130,7 @@ local function startMissionFarm()
                 local gui = player:FindFirstChild("PlayerGui")
                 if not gui then return end
                 for _, label in ipairs(gui:GetDescendants()) do
-                    if not active() then return end
+                    if not canFarm() then return end
                     if label.Name == "Key" and label:IsA("TextLabel") and isVisible(label) then
                         local code = keys[label.Text:upper()]
                         if code then key(code) end
@@ -1175,12 +1214,13 @@ local function startMissionFarm()
         end
     end
     local function iteration()
+        if not canFarm() then task.wait(0.1); return end
         local character = player.Character
         local root = character and character:FindFirstChild("HumanoidRootPart")
         local humanoid = character and character:FindFirstChildOfClass("Humanoid")
         if not root or not humanoid or humanoid.Health <= 0 then release(); task.wait(0.5); return end
         local function valid()
-            return active() and player.Character == character and root.Parent == character and humanoid.Health > 0
+            return canFarm() and player.Character == character and root.Parent == character and humanoid.Health > 0
         end
         local setsLeft, segmentsLeft = bladeStatus(character)
         if setsLeft == nil then
@@ -1209,6 +1249,7 @@ local function startMissionFarm()
                 print("[AUTO PRESTIGE] Blades empty: teleporting to " .. station:GetFullName())
                 local ok, err = pcall(function()
                     clearRefillHold()
+                    root.Anchored = false
                     root.CFrame = station.CFrame + Vector3.new(0, 3, 0)
                     root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
                     root.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
@@ -1258,7 +1299,12 @@ local function startMissionFarm()
                 end
             end
         end
-        if not target then release(); task.wait(0.5); return end
+        if not target then
+            root.Anchored = false
+            task.wait(0.5)
+            if not valid() then release() end
+            return
+        end
         local hand = rig(character):FindFirstChild("LeftHand", true)
         local blade = hand and hand:FindFirstChild("Blade_1")
         if blade and blade:GetAttribute("Broken") == true then
@@ -1274,31 +1320,42 @@ local function startMissionFarm()
         local duration = math.max(0.05, (root.Position - destination.Position).Magnitude / 300)
         local tween = tweenService:Create(root, TweenInfo.new(duration, Enum.EasingStyle.Linear), {CFrame = destination})
         farm.tween = tween
+        local finished, playbackState = false, nil
+        local completedConnection = tween.Completed:Connect(function(state)
+            playbackState, finished = state, true
+        end)
         tween:Play()
-        local started = os.clock()
         local empty = false
-        while valid() and os.clock() - started < duration
-            and tween.PlaybackState == Enum.PlaybackState.Playing do
+        -- Wait for actual completion, retaining cancellation for Skip/refill/Lobby.
+        while valid() and nape.Parent and not finished do
             local sets, segments = bladeStatus(character)
             if sets == 0 and segments == 0 then empty = true; break end
-            task.wait(0.1)
+            task.wait(0.05)
         end
-        tween:Cancel()
+        if not finished then tween:Cancel() end
+        completedConnection:Disconnect()
         if farm.tween == tween then farm.tween = nil end
-        if empty then holdBeforeRefill(root); return end
+        if empty then
+            if valid() then holdBeforeRefill(root) else release() end
+            return
+        end
         if not valid() or not nape.Parent then release(); return end
+        if playbackState ~= Enum.PlaybackState.Completed then return end
         root.Anchored = true
         local post = remote("POST")
         if post then
-            post:FireServer("Attacks", "Slash", true)
-            post:FireServer("Hitboxes", "Register", nape, math.random() * 0.1 + 0.05)
-            post:FireServer("Attacks", "Slash", false)
+            pcall(function()
+                post:FireServer("Attacks", "Slash", true)
+                post:FireServer("Hitboxes", "Register", nape, math.random() * 0.1 + 0.05)
+                post:FireServer("Attacks", "Slash", false)
+            end)
         end
         input:SendMouseButtonEvent(0, 0, 0, true, game, 0)
         task.wait(0.05)
         input:SendMouseButtonEvent(0, 0, 0, false, game, 0)
         task.wait(0.15)
-        root.Anchored = false
+        -- Keep the character anchored between farm iterations, not during refill/cutscenes.
+        if valid() then root.Anchored = true else release() end
     end
     task.spawn(function()
         while active() do
