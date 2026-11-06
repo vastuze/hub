@@ -1,4 +1,4 @@
--- Auto prestige: Lobby setup, upgrades, 2.5 farm/retry, 3.0 Rewards webhook, timed return.
+-- Auto prestige: Lobby setup, upgrades, 2.5 farm/retry, 3.0 Rewards webhook, timed return. chỉnh webhook ở line 785
 -- Standalone: does not load or modify titan_pphud.luau.
 -- Re-run in Lobby after a place teleport; automatic reinjection is not installed.
 -- Step 1.5 spends Gold through the game's Upgrade All button; never spends Gems.
@@ -784,7 +784,7 @@ end
 local function startRewardsWebhook()
 local app = {webhook = true}
 -- Client/autoexec: send once when the end-of-match Rewards UI appears.
-local WEBHOOK_URL = "https://discord.com/api/webhooks/1568169811911901320/AoK8uqagJBi3FwYcmOM08UDsY-URuxHy__K5vf2SAL-MEY7DiXwHQEJt9i60bRJgCnV5"
+local WEBHOOK_URL = "" -- đây là webhook
 local Players = game:GetService("Players")
 local HttpService = game:GetService("HttpService")
 while not game:IsLoaded() do task.wait(0.25) end
