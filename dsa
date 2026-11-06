@@ -2,6 +2,9 @@
 -- Standalone: does not load or modify titan_pphud.luau.
 -- Re-run in Lobby after a place teleport; automatic reinjection is not installed.
 -- Step 1.5 spends Gold through the game's Upgrade All button; never spends Gems.
+-- Flow: load -> Slot A/Lobby -> Claim All -> Upgrade All/read Grade
+-- -> Shiganshina/Breach + 11 modifiers/Start -> farm/retry/skip/webhook
+-- -> return at Gold target or 600 seconds -> re-execute in Lobby.
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 -- Autoexec may run before the client and game UI have initialized.
@@ -347,24 +350,16 @@ local function saveNextGradePlan(player, equipment, values, potential)
     if potential >= 15 then return end
     local blades = awaitPath(equipment, {"Stats", "Blades"})
     assert(isVisible(blades), "Cannot calculate ODM target while Blades is inactive.")
-    local target, cost, count = potential + 1, 0, 0
-    for _, stat in ipairs(blades:GetChildren()) do
-        if stat:IsA("CanvasGroup") then
-            click(awaitPath(stat, {"Inner", "Interact"}))
-            task.wait(0.3)
-            local text = awaitPath(equipment, {"Stat", "Inner", "Upgrade_Values", "Current"}).Text
-            local tag = text:gsub("<[^>]*>", ""):match("%[([^%]]+)%]")
-            local level
-            for index, name in pairs(values.Pot_Tags) do if name == tag then level = index end end
-            assert(level ~= nil, "Cannot read Grade of " .. stat.Name)
-            for nextLevel = level + 1, target do cost = cost + values.Upgrade_Costs[nextLevel] end
-            count = count + 1
-        end
-    end
-    assert(count == 8 and cost > 0, "Invalid next-Grade snapshot.")
+    -- Do not select individual stats. Estimate one Grade for eight equally leveled stats.
+    -- Uneven stats can have a different real cost; Upgrade All remains server-controlled.
+    local target = potential + 1
+    local price = values.Upgrade_Costs[target]
+    assert(type(price) == "number" and price > 0, "Missing next-Grade price.")
+    local cost = math.floor(price) * 8
+    plan.estimated = true
     plan.goldTarget, plan.targetGrade = cost, values.Pot_Tags[target]
     save()
-    print("[AUTO PRESTIGE] Step 3.5: return at " .. cost .. " Gold for Grade " .. plan.targetGrade)
+    print("[AUTO PRESTIGE] Step 3.5: estimated return target " .. cost .. " Gold for Grade " .. plan.targetGrade)
 end
 
 local function readDifficulty(player)
@@ -438,6 +433,117 @@ local function readDifficulty(player)
     return difficulty
 end
 
+local function claimAllAchievements(player)
+    local interface = awaitPath(player, {"PlayerGui", "Interface"})
+    local ui = awaitPath(interface, {"Achievements"})
+    local achievementIcon = awaitPath(interface, {"Topbar", "Main", "Icons", "Achievements"})
+    local notification = awaitPath(achievementIcon, {"New"})
+    -- The game exposes claimable achievements through this notification.
+    -- Do not open the menu at all if no reward is advertised.
+    if not isVisible(ui) and not notification.Visible then
+        print("[AUTO PRESTIGE] 3.7: No new achievements; skipping Claim UI.")
+        return
+    end
+    local titles = require(ReplicatedStorage.Modules.Storage.Titles)
+    local list = awaitPath(ui, {"List", "Inner"})
+    local confirmed, failures = 0, 0
+    local function waitUntil(callback, description)
+        local deadline = os.clock() + 10
+        repeat
+            if callback() then return end
+            task.wait(0.1)
+        until os.clock() >= deadline
+        error("Achievements timeout: " .. description)
+    end
+    local function buttonOf(object)
+        if object:IsA("GuiButton") then return object end
+        local button = object:FindFirstChild("Interact", true)
+        assert(button and button:IsA("GuiButton"), "Achievements button missing: " .. object.Name)
+        return button
+    end
+    local close = awaitPath(ui, {"Top", "Achievements_Close"})
+    local function categoriesVisible()
+        for _, category in pairs(titles) do
+            if list:FindFirstChild(category.Tag) then return true end
+        end
+        return false
+    end
+    local function backToCategories()
+        if categoriesVisible() then return end
+        click(buttonOf(close))
+        waitUntil(categoriesVisible, "return to categories")
+        task.wait(0.3)
+    end
+    local ok, err = pcall(function()
+        if not isVisible(ui) then
+            click(achievementIcon)
+            waitUntil(function() return isVisible(ui) end, "open UI")
+            task.wait(0.7)
+        end
+        backToCategories()
+        -- Revisit notifications after claims unlock meta achievements.
+        -- Never enter a category without its own New indicator.
+        for _ = 1, 5 do
+            local beforePass = confirmed
+            for _, category in ipairs(titles) do
+                backToCategories()
+                local row = list:FindFirstChild(category.Tag)
+                assert(row, "Missing achievement category: " .. category.Tag)
+                local categoryNew = findPath(row, {"Inner", "Icon", "New"})
+                if categoryNew and categoryNew.Visible then
+                click(buttonOf(row))
+                waitUntil(function() return not categoriesVisible() end, "open " .. category.Tag)
+                task.wait(0.4)
+                local attempted = {}
+                while true do
+                    local pending
+                    for _, entry in ipairs(list:GetChildren()) do
+                        local inner = entry:FindFirstChild("Inner")
+                        if inner then
+                            for _, name in ipairs({"A_State", "C_State"}) do
+                                local state = inner:FindFirstChild(name)
+                                local label = state and state:FindFirstChild("Title")
+                                if label and label.Text:upper() == "CLAIM" and isVisible(state)
+                                    and not attempted[state] then pending = state; break end
+                            end
+                        end
+                        if pending then break end
+                    end
+                    if not pending then break end
+                    attempted[pending] = true
+                    -- Dispatch the game's handler: Claim vs Category and cache/Gems updates
+                    -- are handled by Achievements.Continue. Never click EQUIP/UNEQUIP.
+                    click(buttonOf(pending))
+                    local deadline = os.clock() + 3
+                    local changed = false
+                    repeat
+                        task.wait(0.1)
+                        local label = pending:FindFirstChild("Title")
+                        changed = not isVisible(pending) or (label and label.Text:upper() ~= "CLAIM")
+                        if changed then break end
+                    until os.clock() >= deadline
+                    if changed then confirmed = confirmed + 1
+                    else
+                        failures = failures + 1
+                        warn("[AUTO PRESTIGE] 3.7: Claim not confirmed in " .. category.Tag)
+                    end
+                    task.wait(0.25)
+                end
+                end
+            end
+            if confirmed == beforePass or failures > 0 then break end
+        end
+    end)
+    -- Close the menu before Equipment/Create; open Achievements blocks other buttons.
+    if isVisible(ui) then
+        backToCategories()
+        click(buttonOf(close))
+        waitUntil(function() return not isVisible(ui) end, "close UI")
+    end
+    if not ok then error(err) end
+    print("[AUTO PRESTIGE] 3.7: " .. confirmed .. " claims confirmed across categories; " .. failures .. " unconfirmed.")
+end
+
 local function startMission(player, difficulty)
     local remote = awaitPath(ReplicatedStorage, {"Assets", "Remotes", "GET"})
     local config = {Name = "Shiganshina", Type = "Missions", Objective = "Breach", Difficulty = difficulty}
@@ -509,7 +615,7 @@ end
 local function startRewardsWebhook()
 local app = {webhook = true}
 -- Client/autoexec: send once when the end-of-match Rewards UI appears.
-local WEBHOOK_URL = "https://discord.com/api/webhooks/996043763858288700/z3Nh4ETcF5ZMeX3_C2CSs8R5ERoC4LJRHDoVjY773LNyHJfcLF2-0jZFEn8J17_62GKC"
+local WEBHOOK_URL = "https://discord.com/api/webhooks/1568169811911901320/AoK8uqagJBi3FwYcmOM08UDsY-URuxHy__K5vf2SAL-MEY7DiXwHQEJt9i60bRJgCnV5"
 local Players = game:GetService("Players")
 local HttpService = game:GetService("HttpService")
 while not game:IsLoaded() do task.wait(0.25) end
@@ -822,6 +928,32 @@ local function matchDetails(stateText)
     return table.concat(lines, "\n")
 end
 
+-- Gear_Up may not exist in mission places. Carry a labeled UI snapshot across teleports.
+local boostFile = "auto_prestige_boost_" .. tostring(game.GameId) .. "_" .. tostring(player.UserId) .. ".json"
+local boostSnapshot
+if type(readfile) == "function" then
+    local ok, saved = pcall(function() return HttpService:JSONDecode(readfile(boostFile)) end)
+    if ok and type(saved) == "table" and saved.userId == player.UserId and saved.gameId == game.GameId
+        and type(saved.timer) == "string" and type(saved.capturedAt) == "number" then boostSnapshot = saved end
+end
+local function captureGoldBoost(interface)
+    local gold = childPath(interface, {"Gear_Up", "Boosts", "Gold"})
+    local timer = childPath(gold, {"Time", "Time"})
+    local multiplier = childPath(gold, {"Main", "Multiplier"})
+    if not timer then return end
+    local text = cleanText(timer.Text)
+    if not text:match("^%d+:%d%d") then return end
+    local multi = multiplier and cleanText(multiplier.Text) or ""
+    local changed = not boostSnapshot or boostSnapshot.timer ~= text or boostSnapshot.multiplier ~= multi
+    if changed then
+        boostSnapshot = {userId = player.UserId, gameId = game.GameId, timer = text,
+            multiplier = multi, capturedAt = os.time(), placeId = game.PlaceId}
+        if type(writefile) == "function" then
+            pcall(function() writefile(boostFile, HttpService:JSONEncode(boostSnapshot)) end)
+        end
+    end
+end
+
 local function makeFields(interface, main, rows, goldSummary)
     local fields = {}
     local state = childPath(main, {"Info", "State"})
@@ -841,6 +973,18 @@ local function makeFields(interface, main, rows, goldSummary)
         fields[#fields + 1] = {name = currency .. " (balance)", value = value, inline = true}
     end
     local parts, length = {}, 0
+    captureGoldBoost(interface)
+    local boostText = "Chua doc duoc timer; can chay script tai Lobby truoc."
+    if boostSnapshot then
+        boostText = boostSnapshot.timer .. (boostSnapshot.multiplier ~= "" and " | " .. boostSnapshot.multiplier or "")
+            .. "\nLast UI snapshot: " .. os.date("!%Y-%m-%d %H:%M:%S UTC", boostSnapshot.capturedAt)
+            .. "\nNot a live countdown; boost time is not estimated."
+    end
+    fields[#fields + 1] = {
+        name = "Gold Boost (game UI)",
+        value = boostText,
+        inline = true,
+    }
     for _, row in ipairs(rows) do
         if goldSummary and row:match("^%+[%d,]+ Gold$") then
             row = goldSummary.goldLine or row
@@ -918,6 +1062,7 @@ task.spawn(function()
         task.wait(0.1)
         local ok = pcall(function()
             local interface = childPath(player, {"PlayerGui", "Interface"})
+            captureGoldBoost(interface)
             local main = childPath(interface, {"Rewards", "Main"})
             local now = os.clock()
             if not visible(main) then
@@ -1065,11 +1210,11 @@ local function startMissionFarm()
                 end
             elseif farm.cutscenePaused then
                 clickedUI = nil
-                local resumeAt = os.clock() + 1
+                local resumeAt = os.clock() + 0.2
                 repeat task.wait(0.1) until not active() or skipUI() or os.clock() >= resumeAt
                 if active() and not skipUI() then
                     farm.cutscenePaused = false
-                    print("[AUTO PRESTIGE] Step 2.7: Skip UI closed; farm resumed after 1 second.")
+                    print("[AUTO PRESTIGE] Step 2.7: Skip UI closed; farm resumed after 0.2 seconds.")
                 end
             end
             task.wait(0.1)
@@ -1368,20 +1513,32 @@ local function startMissionFarm()
     print("[AUTO PRESTIGE] Step 2.5: Auto Farm + Auto Retry enabled (no HUD).")
 end
 
-local ok, message = pcall(function()
-    startRewardsWebhook()
+local function runPrestigeFlow()
+    -- A new execution resumes the appropriate branch after each place teleport.
     if inMission() then
+        print("[AUTO PRESTIGE] Map: Auto Farm + Retry + Skip + Rewards Webhook.")
+        startRewardsWebhook()
         startLobbyTimer()
         startMissionFarm()
         return
     end
+
+    -- Menu: select Slot A and request Lobby; never run Lobby UI in the menu.
     if not selectLobby() then
-        print("[AUTO PRESTIGE] Re-run this file in Lobby after teleport to continue steps 1.5 and 2.")
+        print("[AUTO PRESTIGE] Re-run in Lobby: Claim All -> Upgrade All -> Grade -> mission.")
         return
     end
     local player = waitForValue(function() return Players.LocalPlayer end)
     assert(player, "LocalPlayer did not load.")
+
+    -- Background balance capture must run in Lobby too, to carry Gold/Gems into map.
+    startRewardsWebhook()
+    print("[AUTO PRESTIGE] Lobby: Claim All -> Upgrade All -> read Grade.")
+    claimAllAchievements(player)
     local difficulty = readDifficulty(player)
+    print("[AUTO PRESTIGE] Mission: Shiganshina/Breach -> 11 modifiers -> Start.")
     startMission(player, difficulty)
-end)
+end
+
+local ok, message = pcall(runPrestigeFlow)
 if not ok then warn("[AUTO PRESTIGE] Stopped: " .. tostring(message)) end
