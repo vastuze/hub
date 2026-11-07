@@ -1,4 +1,91 @@
-repeat task.wait(5) until game:IsLoaded(5)
+-- Auto prestige: Lobby setup, upgrades, 2.5 farm/retry, 3.0 Rewards webhook, timed return.
+-- Standalone: does not load or modify titan_pphud.luau.
+-- Re-run in Lobby after a place teleport; automatic reinjection is not installed.
+-- Step 1.5 spends Gold through the game's Upgrade All button; never spends Gems.
+-- Flow: load -> Slot A/Lobby -> Claim All -> Upgrade All/read Grade
+-- -> Shiganshina/Breach + 11 modifiers/Start -> farm/retry/skip/webhook
+-- -> return at Gold target or 600 seconds -> re-execute in Lobby.
+-- Gold is an absolute amount; P1 means the transition from P0 to P1.
+repeat task.wait(1) until game:IsLoaded()
+local configEnv = type(getgenv) == "function" and getgenv() or _G
+-- Configuration is supplied by loadstring.lua before this script runs.
+-- Safe fallbacks for standalone execution; never replace explicit loader settings.
+if configEnv.UseGoldBoost == nil then
+    configEnv.UseGoldBoost = false
+    warn("[AUTO PRESTIGE] Loader config missing: Gold Potion purchases disabled. Run loadstring.lua to apply your settings.")
+end
+if configEnv.GoldPotionHours == nil then configEnv.GoldPotionHours = 2 end
+-- Temporary mobile isolation: do not open Quests automatically on touch devices.
+if configEnv.ClaimQuests == nil then
+    configEnv.ClaimQuests = not game:GetService("UserInputService").TouchEnabled
+end
+assert(type(configEnv.ClaimQuests) == "boolean", "ClaimQuests must be true or false.")
+if configEnv.QuestVirtualInput == nil then
+    configEnv.QuestVirtualInput = game:GetService("UserInputService").TouchEnabled
+end
+assert(type(configEnv.QuestVirtualInput) == "boolean", "QuestVirtualInput must be true or false.")
+if configEnv.WebhookURL == nil then configEnv.WebhookURL = "" end
+if configEnv.Height == nil then configEnv.Height = 400 end
+if configEnv.Speed == nil then configEnv.Speed = 350 end
+if configEnv.PrestigeSettings == nil then
+    configEnv.PrestigeSettings = {
+        P1 = {Gold = 200000000}, P2 = {Gold = 400000000}, P3 = {Gold = 600000000},
+        P4 = {Gold = 800000000}, P5 = {Gold = 1000000000},
+    }
+end
+if configEnv.Modifiers == nil then
+    configEnv.Modifiers = {"No Perks", "No Skills", "No Memories", "Nightmare", "Injury Prone",
+        "Chronic Injuries", "Fog", "Glass Cannon", "Time Trial", "Fatigue", "Evolution"}
+end
+if configEnv.WebhookImageURL == nil then configEnv.WebhookImageURL = "https://cdn.discordapp.com/attachments/983578378370170911/1568333579883384972/1781178911498_z7o8gg4.png?ex=6aef6ff7&is=6aee1e77&hm=b9eefe3c083a463fceeb9791566751d8c37e09668e1d65c9a9a39fa297d74765&" end
+assert(type(configEnv.UseGoldBoost) == "boolean",
+    "UseGoldBoost must be true or false WITHOUT quotes; received " .. type(configEnv.UseGoldBoost))
+assert(type(configEnv.PrestigeSettings) == "table", "PrestigeSettings must be a table.")
+assert(type(configEnv.Modifiers) == "table", "Modifiers must be a list of names.")
+do
+    local allowed = {"No Perks", "No Skills", "No Memories", "Nightmare", "Injury Prone",
+        "Chronic Injuries", "Fog", "Glass Cannon", "Time Trial", "Fatigue", "Evolution",
+        "Oddball", "Boring", "Simple", "Primitive"}
+    local seen, count = {}, 0
+    for index, name in pairs(configEnv.Modifiers) do
+        assert(type(index) == "number" and index >= 1 and index % 1 == 0
+            and type(name) == "string", "Modifiers must be a consecutive list of strings.")
+        local valid = false
+        for _, known in ipairs(allowed) do if known == name then valid = true; break end end
+        assert(valid and not seen[name], "Unknown or duplicate modifier: " .. tostring(name))
+        seen[name], count = true, count + 1
+    end
+    for index = 1, count do assert(configEnv.Modifiers[index], "Modifiers list must not contain gaps.") end
+end
+if configEnv.UseGoldBoost then
+    assert(type(configEnv.GoldPotionHours) == "number"
+        and configEnv.GoldPotionHours >= 0 and configEnv.GoldPotionHours < math.huge
+        and (configEnv.GoldPotionHours * 2) % 1 == 0,
+        "GoldPotionHours must be a non-negative multiple of 0.5 hours.")
+end
+assert(type(configEnv.WebhookURL) == "string", "WebhookURL must be a string.")
+assert(type(configEnv.WebhookImageURL) == "string"
+    and (configEnv.WebhookImageURL == "" or configEnv.WebhookImageURL:match("^https://%S+$")),
+    "WebhookImageURL must be empty or a public HTTPS image URL.")
+for _, key in ipairs({"Height", "Speed"}) do
+    local value = configEnv[key]
+    assert(type(value) == "number" and value == value and value > 0 and value < math.huge,
+        "" .. key .. " must be a finite positive number.")
+end
+
+local function configuredPrestigeGold(rank)
+    if type(rank) ~= "number" or rank % 1 ~= 0 or rank < 0 or rank >= 5 then return nil end
+    local key = "P" .. tostring(rank + 1)
+    local entry = configEnv.PrestigeSettings[key]
+    if entry == nil then return 100000000 * (2 ^ rank) end
+    assert(type(entry) == "table", "PrestigeSettings." .. key .. " must be a table.")
+    local gold = entry.Gold
+    if gold == nil then return 100000000 * (2 ^ rank) end
+    assert(type(gold) == "number" and gold == gold and gold >= 0 and gold < math.huge
+        and gold % 1 == 0, "PrestigeSettings." .. key .. ".Gold must be a finite non-negative integer.")
+    return gold
+end
+for rank = 0, 4 do configuredPrestigeGold(rank) end
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 -- Autoexec may run before the client and game UI have initialized.
@@ -21,7 +108,9 @@ local function prestigeTarget(player)
     end
     if type(saved) == "table" and saved.userId == player.UserId and saved.gameId == game.GameId
         and type(saved.rank) == "number" and saved.rank >= 0 and saved.rank < 5 then
-        return 100000000 * (2 ^ saved.rank)
+        local target = configuredPrestigeGold(saved.rank)
+        -- Zero removes the Lobby Gold gate, but must not cause instant mission returns.
+        if target and target > 0 then return target end
     end
 end
 local lobbyPlaces = {[4658598196] = 14916516914, [5310627045] = 15393230099}
@@ -39,6 +128,34 @@ local function inMission()
     return false
 end
 
+local function goldBoostExpired(timer, player)
+    if not configEnv.UseGoldBoost or not configEnv.GoldPotionHours or configEnv.GoldPotionHours <= 0 then
+        timer.goldBoostSeen = false
+        timer.goldBoostZeroSince = nil
+        return false
+    end
+    local boosts = player and player:FindFirstChild("Boosts")
+    local gold = boosts and boosts:FindFirstChild("Gold")
+    if not gold or not (gold:IsA("NumberValue") or gold:IsA("IntValue")) then
+        timer.goldBoostZeroSince = nil
+        return false
+    end
+    local seconds = gold.Value
+    if type(seconds) ~= "number" or seconds ~= seconds or seconds < 0 or seconds == math.huge then
+        timer.goldBoostZeroSince = nil
+        return false
+    end
+    if seconds > 0 then
+        timer.goldBoostSeen = true
+        timer.goldBoostZeroSince = nil
+        return false
+    end
+    -- Starting a mission without a potion (e.g. insufficient Gems) must not cause a return loop.
+    if not timer.goldBoostSeen then return false end
+    timer.goldBoostZeroSince = timer.goldBoostZeroSince or os.clock()
+    return os.clock() - timer.goldBoostZeroSince >= 1
+end
+
 local function startLobbyTimer()
     local env = type(getgenv) == "function" and getgenv() or _G
     local previous = env.AutoPrestigeLobbyTimer
@@ -50,6 +167,7 @@ local function startLobbyTimer()
     local timer = {jobId = game.JobId, placeId = game.PlaceId, deadline = os.clock() + 600}
     env.AutoPrestigeLobbyTimer = timer
     local player = Players.LocalPlayer
+    goldBoostExpired(timer, player)
     local planFile = "auto_prestige_grade_" .. tostring(game.GameId) .. "_" .. tostring(player.UserId) .. ".json"
     local plan = env.AutoPrestigeGradePlan
     if type(readfile) == "function" then
@@ -62,6 +180,10 @@ local function startLobbyTimer()
     print("[AUTO PRESTIGE] In mission: requesting Lobby in 600 seconds.")
     task.spawn(function()
         while env.AutoPrestigeLobbyTimer == timer and inMission() do
+            if goldBoostExpired(timer, player) then
+                timer.reason = "Gold Boost expired; return to Lobby to restock"
+                break
+            end
             local watcher = env.AutoPrestigeRewardsWatcher
             local gold = watcher and watcher.balance and watcher.balance()
             local target = timer.prestigeGoldTarget
@@ -252,13 +374,15 @@ local function awaitPath(root, names)
     return node
 end
 
-local function click(button, preferredEvent)
+local function click(button, preferredEvent, stillNeeded, virtualOnly)
     assert(button:IsA("GuiButton"), "Not a UI button: " .. button:GetFullName())
     -- Instances can replicate before Effects.Hover installs their click callbacks.
     -- A preferred event keeps one-shot confirmations from firing both click signals.
     local events = preferredEvent and {preferredEvent} or {"MouseButton1Click", "Activated"}
     local deadline = os.clock() + 5
     repeat
+        if virtualOnly then break end
+        if stillNeeded and not stillNeeded() then return end
         if type(getconnections) == "function" then
             for _, eventName in ipairs(events) do
                 local ok, handlers = pcall(function() return getconnections(button[eventName]) end)
@@ -273,6 +397,7 @@ local function click(button, preferredEvent)
                     end
                 end
                 if #usable > 0 then
+                    if stillNeeded and not stillNeeded() then return end
                     -- Do not fall back after dispatch: that could buy upgrades twice.
                     for _, connection in ipairs(usable) do
                         if eventName == "Activated" then connection:Fire(nil, 1)
@@ -285,14 +410,30 @@ local function click(button, preferredEvent)
         task.wait(0.2)
     until not button.Parent or os.clock() >= deadline
 
+    if stillNeeded and not stillNeeded() then return end
     assert(button.Parent and isVisible(button), "Button unavailable for virtual input: " .. button:GetFullName())
     local size, position = button.AbsoluteSize, button.AbsolutePosition
     assert(size.X > 0 and size.Y > 0, "Button has no clickable size: " .. button.Name)
     local input = game:GetService("VirtualInputManager")
     local x, y = position.X + size.X / 2, position.Y + size.Y / 2
+    if virtualOnly then
+        local camera = workspace.CurrentCamera
+        assert(camera and x >= 0 and y >= 0 and x < camera.ViewportSize.X and y < camera.ViewportSize.Y,
+            "Quest input target is outside the screen; stopping instead of clicking elsewhere.")
+        local ancestor = button.Parent
+        while ancestor do
+            if ancestor:IsA("GuiObject") and ancestor.ClipsDescendants then
+                local p, s = ancestor.AbsolutePosition, ancestor.AbsoluteSize
+                assert(x >= p.X and y >= p.Y and x < p.X + s.X and y < p.Y + s.Y,
+                    "Quest input target is clipped; scroll it into view before retrying.")
+            end
+            ancestor = ancestor.Parent
+        end
+    end
     print("[AUTO PRESTIGE] Using virtual click: " .. button:GetFullName())
     input:SendMouseMoveEvent(x, y, game)
     task.wait(0.05)
+    if stillNeeded and not stillNeeded() then return end
     local ok, message = pcall(function()
         input:SendMouseButtonEvent(x, y, 0, true, game, 0)
         task.wait(0.1)
@@ -402,6 +543,16 @@ local function saveNextGradePlan(player, equipment, values, potential)
     print("[AUTO PRESTIGE] Step 3.5: estimated return target " .. cost .. " Gold for Grade " .. plan.targetGrade)
 end
 
+local function sendLobbyResult(result, fields)
+    local watcher = configEnv.AutoPrestigeRewardsWatcher
+    if configEnv.WebhookURL == "" or not watcher or not watcher.send then return end
+    table.insert(fields, 1, {name = "Results", value = result, inline = false})
+    local ok, sent, reason = pcall(watcher.send, fields, result)
+    if not ok or not sent then
+        warn("[WEBHOOK] Lobby result not sent; continuing without retry: " .. tostring(ok and reason or "request error"))
+    end
+end
+
 local function readDifficulty(player)
     local gui = awaitPath(player, {"PlayerGui"})
     local interface = awaitPath(gui, {"Interface"})
@@ -409,7 +560,12 @@ local function readDifficulty(player)
     local equipmentButton = awaitPath(interface, {"Topbar", "Main", "Categories", "Equipment", "Interact"})
     -- IsLoaded only covers Roblox loading, not the game's delayed UI setup.
     print("[AUTO PRESTIGE] Waiting for Lobby Equipment UI initialization...")
+    local handlerDeadline = os.clock() + 10
     while not isVisible(equipment) and type(getconnections) == "function" do
+        if os.clock() >= handlerDeadline then
+            warn("[AUTO PRESTIGE] Equipment handlers unavailable after 10 seconds; trying normal click fallback.")
+            break
+        end
         local ready = false
         for _, signal in ipairs({"MouseButton1Click", "Activated"}) do
             local ok, handlers = pcall(function() return getconnections(equipmentButton[signal]) end)
@@ -435,6 +591,10 @@ local function readDifficulty(player)
     task.wait(1)
 
     local values = require(ReplicatedStorage.Modules.Storage.Values)
+    local beforeTitle = findPath(equipment, {"Categories", "Upgrades", "Main", "Title"})
+    local beforeText = beforeTitle and beforeTitle.Text:gsub("<[^>]*>", ""):upper() or ""
+    local beforeGrade = beforeText:match("%[([A-S][%+%-]?)%s+GRADE%]")
+        or beforeText:match("%[GRADE%s+([A-S][%+%-]?)%]")
     local upgraded, upgradeError = pcall(upgradeAll, player, interface, equipment, values)
     if not upgraded then
         warn("[AUTO PRESTIGE] Upgrade stopped; continuing step 2: " .. tostring(upgradeError))
@@ -451,6 +611,13 @@ local function readDifficulty(player)
         end
     end)
     assert(found, "Could not read Equipment Grade.")
+    local beforeIndex
+    for index, tag in pairs(values.Pot_Tags) do if tag == beforeGrade then beforeIndex = index end end
+    if beforeIndex and gradeIndex > beforeIndex then
+        sendLobbyResult("GRADE UPGRADED", {
+            {name = "Grade", value = beforeGrade .. " -> " .. grade, inline = true},
+        })
+    end
     local planned, planError = pcall(saveNextGradePlan, player, equipment, values, gradeIndex)
     if not planned then warn("[AUTO PRESTIGE] Grade target unavailable; using 10-minute return: " .. tostring(planError)) end
     -- Refresh the reward ledger after spending Gold, before entering the map.
@@ -632,9 +799,13 @@ local function tryPrestige(player)
         text = text:gsub("<[^>]*>", ""):gsub(",", ""):gsub("%s", "")
         if text:match("^%d+$") then gold = tonumber(text) end
     end
-    local target = 100000000 * (2 ^ rank)
+    local target = configuredPrestigeGold(rank)
+    if target == nil then
+        print("[AUTO PRESTIGE] P1-P5 configuration complete; skipping further Prestige.")
+        return
+    end
     print("[AUTO PRESTIGE] 4.0: P" .. rank .. " | Gold " .. tostring(gold) .. " | Target " .. target)
-    if type(gold) ~= "number" or gold < target then
+    if target > 0 and (type(gold) ~= "number" or gold < target) then
         print("[AUTO PRESTIGE] Prestige skipped: Gold below target or exact balance unavailable.")
         return
     end
@@ -932,9 +1103,13 @@ local function startMission(player, difficulty)
         mission = waitForValue(findMission)
     end
     assert(mission, "Mission did not replicate; check party and difficulty unlocks.")
-    local wanted = {"No Perks", "No Skills", "No Memories", "Nightmare", "Injury Prone",
-        "Chronic Injuries", "Fog", "Glass Cannon", "Time Trial", "Fatigue", "Evolution"}
-    local excluded = {"Oddball", "Boring", "Simple", "Primitive"}
+    local wanted = configEnv.Modifiers
+    local known = {"No Perks", "No Skills", "No Memories", "Nightmare", "Injury Prone",
+        "Chronic Injuries", "Fog", "Glass Cannon", "Time Trial", "Fatigue", "Evolution",
+        "Oddball", "Boring", "Simple", "Primitive"}
+    local selected, excluded = {}, {}
+    for _, name in ipairs(wanted) do selected[name] = true end
+    for _, name in ipairs(known) do if not selected[name] then excluded[#excluded + 1] = name end end
     local function enabled(name)
         assert(matches(mission), "Mission changed or you are no longer leader.")
         local state = mission:GetAttribute("Modifiers")
@@ -960,15 +1135,15 @@ local function startMission(player, difficulty)
     task.wait(1)
     for _, name in ipairs(excluded) do assert(not enabled(name), "Excluded modifier enabled: " .. name) end
     for _, name in ipairs(wanted) do assert(enabled(name), "Missing modifier: " .. name) end
-    print("[AUTO PRESTIGE] Step 2: confirmed 11 modifiers; requesting Start.")
+    print("[AUTO PRESTIGE] Step 2: confirmed " .. #wanted .. " configured modifiers; requesting Start.")
     remote:InvokeServer("S_Missions", "Start")
     print("[AUTO PRESTIGE] Start requested.")
 end
 
 local function startRewardsWebhook()
-local app = {webhook = true}
+local app = {webhook = configEnv.WebhookURL ~= ""}
 -- Client/autoexec: send once when the end-of-match Rewards UI appears.
-local WEBHOOK_URL = "https://discord.com/api/webhooks/1568169811911901320/AoK8uqagJBi3FwYcmOM08UDsY-URuxHy__K5vf2SAL-MEY7DiXwHQEJt9i60bRJgCnV5"
+local WEBHOOK_URL = configEnv.WebhookURL
 local Players = game:GetService("Players")
 local HttpService = game:GetService("HttpService")
 while not game:IsLoaded() do task.wait(0.25) end
@@ -1281,30 +1456,52 @@ local function matchDetails(stateText)
     return table.concat(lines, "\n")
 end
 
--- Gear_Up may not exist in mission places. Carry a labeled UI snapshot across teleports.
-local boostFile = "auto_prestige_boost_" .. tostring(game.GameId) .. "_" .. tostring(player.UserId) .. ".json"
-local boostSnapshot
-if type(readfile) == "function" then
-    local ok, saved = pcall(function() return HttpService:JSONDecode(readfile(boostFile)) end)
-    if ok and type(saved) == "table" and saved.userId == player.UserId and saved.gameId == game.GameId
-        and type(saved.timer) == "string" and type(saved.capturedAt) == "number" then boostSnapshot = saved end
+-- Read the replicated potion timer, the same source used by Gear_Up.Boost_Display.
+local function goldPotionText(name)
+    local gold = childPath(player, {"Boosts", name or "Gold"})
+    if not gold or not (gold:IsA("NumberValue") or gold:IsA("IntValue")) then
+        return "Chua doc duoc timer"
+    end
+    local seconds = gold.Value
+    if type(seconds) ~= "number" or seconds ~= seconds or seconds == math.huge or seconds == -math.huge then
+        return "Timer khong hop le"
+    end
+    seconds = math.max(0, math.floor(seconds))
+    return string.format("%02d:%02d:%02d", math.floor(seconds / 3600),
+        math.floor(seconds / 60) % 60, seconds % 60)
 end
-local function captureGoldBoost(interface)
-    local gold = childPath(interface, {"Gear_Up", "Boosts", "Gold"})
-    local timer = childPath(gold, {"Time", "Time"})
-    local multiplier = childPath(gold, {"Main", "Multiplier"})
-    if not timer then return end
-    local text = cleanText(timer.Text)
-    if not text:match("^%d+:%d%d") then return end
-    local multi = multiplier and cleanText(multiplier.Text) or ""
-    local changed = not boostSnapshot or boostSnapshot.timer ~= text or boostSnapshot.multiplier ~= multi
-    if changed then
-        boostSnapshot = {userId = player.UserId, gameId = game.GameId, timer = text,
-            multiplier = multi, capturedAt = os.time(), placeId = game.PlaceId}
-        if type(writefile) == "function" then
-            pcall(function() writefile(boostFile, HttpService:JSONEncode(boostSnapshot)) end)
+
+local function boostsText()
+    local folder = player:FindFirstChild("Boosts")
+    if not folder then return "Chua doc duoc boosts" end
+    local lines = {}
+    for _, boost in ipairs(folder:GetChildren()) do
+        if boost:IsA("NumberValue") or boost:IsA("IntValue") then
+            local multiplier = boost:GetAttribute("Multiplier")
+            local base = type(multiplier) == "number" and multiplier >= 0 and multiplier < math.huge
+                and multiplier or nil
+            local suffix = base and (" | Base " .. tostring(base) .. "x") or ""
+            lines[#lines + 1] = boost.Name .. ": " .. goldPotionText(boost.Name):gsub("\n", " - ") .. suffix
         end
     end
+    table.sort(lines)
+    return #lines > 0 and table.concat(lines, "\n"):sub(1, 1000) or "Khong co du lieu boost"
+end
+
+local function prestigeText()
+    local saved = configEnv.AutoPrestigeRank
+    if type(saved) ~= "table" and type(readfile) == "function" then
+        local ok, value = pcall(function()
+            return HttpService:JSONDecode(readfile(prestigeFile(player)))
+        end)
+        if ok then saved = value end
+    end
+    if type(saved) == "table" and saved.userId == player.UserId and saved.gameId == game.GameId
+        and type(saved.rank) == "number" and saved.rank >= 0 and saved.rank < math.huge
+        and saved.rank % 1 == 0 then
+        return tostring(saved.rank)
+    end
+    return "Chua xac nhan Prestige tai Lobby"
 end
 
 local function makeFields(interface, main, rows, goldSummary)
@@ -1319,25 +1516,10 @@ local function makeFields(interface, main, rows, goldSummary)
             fields[#fields + 1] = {name = stat:gsub("_", " "), value = amount.Text, inline = true}
         end
     end
-    for _, currency in ipairs({"Gold", "Gems"}) do
-        local number = goldLedger.balance
-        if currency == "Gems" then number = goldLedger.gems end
-        local value = validBalance(number) and formatNumber(number) or "Chua doc duoc so du"
-        fields[#fields + 1] = {name = currency .. " (balance)", value = value, inline = true}
-    end
+    fields[#fields + 1] = {name = "Gold Boost Remaining Time", value = goldPotionText(), inline = true}
+    fields[#fields + 1] = {name = "Prestige: " .. prestigeText(), value = "\226\128\139", inline = true}
+    fields[#fields + 1] = {name = "Các boost", value = boostsText(), inline = false}
     local parts, length = {}, 0
-    captureGoldBoost(interface)
-    local boostText = "Chua doc duoc timer; can chay script tai Lobby truoc."
-    if boostSnapshot then
-        boostText = boostSnapshot.timer .. (boostSnapshot.multiplier ~= "" and " | " .. boostSnapshot.multiplier or "")
-            .. "\nLast UI snapshot: " .. os.date("!%Y-%m-%d %H:%M:%S UTC", boostSnapshot.capturedAt)
-            .. "\nNot a live countdown; boost time is not estimated."
-    end
-    fields[#fields + 1] = {
-        name = "Gold Boost (game UI)",
-        value = boostText,
-        inline = true,
-    }
     for _, row in ipairs(rows) do
         if goldSummary and row:match("^%+[%d,]+ Gold$") then
             row = goldSummary.goldLine or row
@@ -1363,7 +1545,7 @@ local function resultColor(stateText)
     return 9807270
 end
 
-local function send(fields, stateText)
+local function send(fields, stateText, useThumbnail)
     if not app.webhook then return false, "Webhook disabled", 1 end
     local requestCall = request or http_request
     if type(requestCall) ~= "function" and type(syn) == "table" then requestCall = syn.request end
@@ -1376,7 +1558,10 @@ local function send(fields, stateText)
             Body = HttpService:JSONEncode({
                 allowed_mentions = {parse = {}},
                 embeds = {{title = "Attack on titan revolution - " .. player.Name, color = resultColor(stateText),
-                    fields = fields, timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ")}},
+                    fields = fields,
+                    image = not useThumbnail and configEnv.WebhookImageURL ~= "" and {url = configEnv.WebhookImageURL} or nil,
+                    thumbnail = useThumbnail and configEnv.WebhookImageURL ~= "" and {url = configEnv.WebhookImageURL} or nil,
+                    timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ")}},
             }),
         })
     end)
@@ -1415,7 +1600,7 @@ task.spawn(function()
         task.wait(0.1)
         local ok = pcall(function()
             local interface = childPath(player, {"PlayerGui", "Interface"})
-            captureGoldBoost(interface)
+
             local main = childPath(interface, {"Rewards", "Main"})
             local now = os.clock()
             if not visible(main) then
@@ -1468,7 +1653,7 @@ task.spawn(function()
             if not app.webhook then sent = true; return end
             watcher.readyMain = main
             attempts = attempts + 1
-            local success, reason, delay = send(makeFields(interface, main, rows, goldSummary), state.Text)
+            local success, reason, delay = send(makeFields(interface, main, rows, goldSummary), state.Text, true)
             if success then
                 sent = true
                 print("[WEBHOOK] Da gui ket qua tran thanh cong (HTTP 2xx).")
@@ -1498,6 +1683,7 @@ local function startMissionFarm()
         local timer = env.AutoPrestigeLobbyTimer
         return farm.running and env.AutoPrestigeFarm == farm and inMission()
             and not (timer and (timer.leaving or os.clock() >= timer.deadline))
+            and not (timer and goldBoostExpired(timer, player))
     end
     local function clearRefillHold()
         if farm.refillHold then farm.refillHold:Destroy(); farm.refillHold = nil end
@@ -1536,7 +1722,7 @@ local function startMissionFarm()
     end
     -- Step 2.7: use the game's Skip button, never a captured nil-instance DebugId.
     task.spawn(function()
-        local clickedUI
+        local clickedUI, clickPending
         while active() do
             local ui = skipUI()
             if ui then
@@ -1545,7 +1731,7 @@ local function startMissionFarm()
                     release()
                     print("[AUTO PRESTIGE] Step 2.7: Skip UI visible; farm paused.")
                 end
-                if clickedUI ~= ui then
+                if clickedUI ~= ui and not clickPending then
                     local button = ui:IsA("GuiButton") and ui or nil
                     if not button then
                         for _, candidate in ipairs(ui:GetDescendants()) do
@@ -1557,17 +1743,23 @@ local function startMissionFarm()
                     end
                     if button then
                         clickedUI = ui
-                        local ok, err = pcall(click, button)
-                        if not ok then warn("[AUTO PRESTIGE] Skip click failed: " .. tostring(err)) end
+                        clickPending = true
+                        task.spawn(function()
+                            local ok, err = pcall(click, button, "MouseButton1Click", function()
+                                return active() and skipUI() == ui and button.Parent and isVisible(button)
+                            end)
+                            clickPending = false
+                            if not ok then warn("[AUTO PRESTIGE] Skip click failed: " .. tostring(err)) end
+                        end)
                     end
                 end
             elseif farm.cutscenePaused then
                 clickedUI = nil
-                local resumeAt = os.clock() + 0.2
-                repeat task.wait(0.1) until not active() or skipUI() or os.clock() >= resumeAt
+                local resumeAt = os.clock() + 0.1
+                repeat task.wait(0.05) until not active() or skipUI() or os.clock() >= resumeAt
                 if active() and not skipUI() then
                     farm.cutscenePaused = false
-                    print("[AUTO PRESTIGE] Step 2.7: Skip UI closed; farm resumed after 0.2 seconds.")
+                    print("[AUTO PRESTIGE] Step 2.7: Skip UI closed; checking farm readiness after 0.1 seconds.")
                 end
             end
             task.wait(0.1)
@@ -1713,12 +1905,23 @@ local function startMissionFarm()
             warn("[AUTO PRESTIGE] Refill: " .. message)
         end
     end
+    local waitReason, waitLoggedAt
+    local function reportFarmWait(reason)
+        if waitReason ~= reason or not waitLoggedAt or os.clock() - waitLoggedAt >= 5 then
+            print("[AUTO PRESTIGE] Farm waiting: " .. reason)
+            waitLoggedAt = os.clock()
+        end
+        waitReason = reason
+    end
     local function iteration()
         if not canFarm() then task.wait(0.1); return end
         local character = player.Character
         local root = character and character:FindFirstChild("HumanoidRootPart")
         local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-        if not root or not humanoid or humanoid.Health <= 0 then release(); task.wait(0.5); return end
+        if not root or not humanoid or humanoid.Health <= 0 then
+            reportFarmWait("character/root/humanoid not ready")
+            release(); task.wait(0.1); return
+        end
         local function valid()
             return canFarm() and player.Character == character and root.Parent == character and humanoid.Health > 0
         end
@@ -1726,7 +1929,8 @@ local function startMissionFarm()
         if setsLeft == nil then
             emptySince, emptyCharacter = nil, nil
             refillWarning("Blade slots not replicated; cannot determine remaining sets.")
-            release(); task.wait(0.5); return
+            reportFarmWait("blade reserve slots not replicated")
+            release(); task.wait(0.1); return
         end
         if setsLeft == 0 and segmentsLeft == 0 then
             -- Wait for a stable 0/7, not a temporary gap while blades are changing.
@@ -1753,8 +1957,15 @@ local function startMissionFarm()
                     root.CFrame = station.CFrame + Vector3.new(0, 3, 0)
                     root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
                     root.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
-                    task.wait(1)
+                    -- Allow arrival replication, but return immediately if reserves are already full.
+                    local arrivalDeadline = os.clock() + 1
+                    repeat
+                        if not valid() then return end
+                        if bladeStatus(character) == 3 then return end
+                        task.wait(0.05)
+                    until os.clock() >= arrivalDeadline
                     if not valid() then return end
+                    if bladeStatus(character) == 3 then return end
                     post:FireServer("Attacks", "Reload", station)
                     -- Only wait for reserve sets (3/3), not equipped segment replication.
                     local deadline = os.clock() + 10
@@ -1762,20 +1973,18 @@ local function startMissionFarm()
                         if not valid() then return end
                         local sets = bladeStatus(character)
                         if sets == 3 then return end
-                        task.wait(0.1)
+                        task.wait(0.05)
                     until os.clock() >= deadline
                     error("Reload did not confirm 3/3 blade sets within 10 seconds.")
                 end)
                 if valid() then
-                    root.CFrame = CFrame.new(oldCF.Position.X, math.max(400, oldCF.Position.Y), oldCF.Position.Z)
+                    root.CFrame = CFrame.new(oldCF.Position.X, math.max(configEnv.Height, oldCF.Position.Y), oldCF.Position.Z)
                         * oldCF.Rotation
                     root.Anchored = true
                     root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
                     root.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
-                    if ok then print("[AUTO PRESTIGE] Blades 3/3: returned above previous position at height 400+; resuming farm.") end
-                    -- Keep the cooldown inside the farm loop: no attacks or tween during refill.
-                    local deadline = os.clock() + 1
-                    while valid() and os.clock() < deadline do task.wait(0.1) end
+                    if ok then print("[AUTO PRESTIGE] Blades 3/3: returned above previous position at configured height; resuming farm.") end
+                    -- No fixed cooldown after 3/3; the next iteration may resume farming.
                 end
                 if not ok then warn("[AUTO PRESTIGE] Refill failed: " .. tostring(err)) end
             else
@@ -1800,10 +2009,15 @@ local function startMissionFarm()
             end
         end
         if not target then
+            reportFarmWait("no living titan with a replicated Nape hitbox")
             root.Anchored = false
-            task.wait(0.5)
+            task.wait(0.1)
             if not valid() then release() end
             return
+        end
+        if waitReason then
+            print("[AUTO PRESTIGE] Farm ready; target: " .. target.Name)
+            waitReason, waitLoggedAt = nil, nil
         end
         local hand = rig(character):FindFirstChild("LeftHand", true)
         local blade = hand and hand:FindFirstChild("Blade_1")
@@ -1815,9 +2029,9 @@ local function startMissionFarm()
         end
         if not valid() or not nape.Parent then return end
         root.Anchored = false
-        local height = math.max(400, nape.Position.Y + 50)
+        local height = math.max(configEnv.Height, nape.Position.Y + 50)
         local destination = CFrame.new(nape.Position.X, height, nape.Position.Z) * CFrame.new(0, 0, 2)
-        local duration = math.max(0.05, (root.Position - destination.Position).Magnitude / 300)
+        local duration = math.max(0.05, (root.Position - destination.Position).Magnitude / configEnv.Speed)
         local tween = tweenService:Create(root, TweenInfo.new(duration, Enum.EasingStyle.Linear), {CFrame = destination})
         farm.tween = tween
         local finished, playbackState = false, nil
@@ -1909,10 +2123,265 @@ local function ensureLobby2D(player)
     error("Lobby menu did not appear after POST Switch 2D + Tab.")
 end
 
+local function claimQuestNotifications(player)
+    if not configEnv.ClaimQuests then
+        print("[AUTO PRESTIGE] Quests disabled by ClaimQuests; continuing without opening Quests.")
+        return
+    end
+    local interface = awaitPath(player, {"PlayerGui", "Interface"})
+    local function questClick(button)
+        click(button, "MouseButton1Click", nil, configEnv.QuestVirtualInput)
+    end
+    local ui = awaitPath(interface, {"Quests"})
+    local function waitUI(check, message)
+        assert(waitForValue(check), message)
+    end
+    if not isVisible(ui) then
+        print("[AUTO PRESTIGE] Waiting for Quests button initialization...")
+        local deadline = os.clock() + 60
+        local button, stableSince
+        repeat
+            button = findPath(interface, {"Topbar", "Main", "Categories", "Quests", "Interact"})
+            local ready = button and button:IsA("GuiButton") and isVisible(button)
+            if ready and not configEnv.QuestVirtualInput and type(getconnections) == "function" then
+                local ok, handlers = pcall(function() return getconnections(button.MouseButton1Click) end)
+                -- Some executors cannot expose handlers; allow the input fallback after a bounded wait.
+                if ok and type(handlers) == "table" then
+                    ready = false
+                    for _, connection in pairs(handlers) do
+                        if connection.Enabled ~= false then ready = true; break end
+                    end
+                end
+            end
+            if ready then stableSince = stableSince or os.clock() else stableSince = nil end
+            if stableSince and os.clock() - stableSince >= 1 then break end
+            if isVisible(ui) then break end
+            task.wait(0.25)
+        until os.clock() >= deadline
+        for attempt = 1, 3 do
+            if isVisible(ui) then break end
+            button = findPath(interface, {"Topbar", "Main", "Categories", "Quests", "Interact"})
+            assert(button and isVisible(button), "Quests entry is unavailable after initialization wait.")
+            print("[AUTO PRESTIGE] Opening Quests, attempt " .. attempt .. "/3")
+            questClick(button)
+            local openedDeadline = os.clock() + 5
+            repeat
+                if isVisible(ui) then break end
+                task.wait(0.1)
+            until os.clock() >= openedDeadline
+        end
+        assert(isVisible(ui), "Quests did not open after initialization wait and 3 attempts.")
+        task.wait(1)
+    end
+    local tabs = {{"Main", "Q_1"}, {"Side", "Q_2"}, {"Spears", "Q_2.1"},
+        {"Daily", "Q_4"}, {"Weekly", "Q_5"}}
+    for week = 1, 10 do tabs[#tabs + 1] = {"Week_" .. week, string.format("Q_7.%02d", week)} end
+    local categories = awaitPath(ui, {"Main", "Quests"})
+    local details = awaitPath(ui, {"Main", "Details"})
+    for _, tab in ipairs(tabs) do
+        local row = categories:FindFirstChild(tab[2])
+        local badge = row and findPath(row, {"Inner", "Title", "New"})
+        if row and isVisible(row) and badge and isVisible(badge)
+            and (not (badge:IsA("ImageLabel") or badge:IsA("ImageButton")) or badge.ImageTransparency < 0.99) then
+            task.wait(0.3)
+            questClick(awaitPath(row, {"Inner", "Interact"}))
+            waitUI(function()
+                local title = findPath(details, {"Title", "Title"})
+                return title and title.Text:upper() == tab[1]:gsub("_", " "):upper() .. " QUESTS"
+                    and isVisible(details)
+            end, "Quest category did not open: " .. tab[1])
+            task.wait(0.75)
+            local attempted = {}
+            while true do
+                assert(isVisible(ui), "Quests closed during claims.")
+                local button, claimed, tag
+                for _, quest in ipairs(details.Quests:GetChildren()) do
+                    local candidate = findPath(quest, {"Inner", "Claim", "Button"})
+                    local name = candidate and candidate:GetAttribute("Tag")
+                    if candidate and isVisible(candidate) and type(name) == "string"
+                        and candidate:GetAttribute("Category") == tab[1] and not attempted[name] then
+                        button, tag = candidate, name
+                        claimed = findPath(quest, {"Inner", "Claimed"})
+                        break
+                    end
+                end
+                if not button then break end
+                attempted[tag] = true
+                task.wait(0.3)
+                questClick(button)
+                waitUI(function()
+                    return button.Parent and button:GetAttribute("Tag") == nil and claimed and isVisible(claimed)
+                end, "Quest claim not confirmed; no retry: " .. tag)
+                print("[AUTO PRESTIGE] Quest claimed: " .. tag)
+            end
+        end
+    end
+end
+
+local function chooseGoldPotion(balance, products, remainingSeconds)
+    if remainingSeconds <= 0 then return nil end
+    for _, product in ipairs(products) do
+        if balance >= product.cost and product.seconds <= remainingSeconds then return product end
+    end
+    local smallest = products[#products]
+    if smallest and remainingSeconds < smallest.seconds and balance >= smallest.cost then return smallest end
+end
+
+local function ensureGoldPotion(player)
+    print("[POTION] Effective config: UseGoldBoost=" .. tostring(configEnv.UseGoldBoost)
+        .. " | GoldPotionHours=" .. tostring(configEnv.GoldPotionHours))
+    if not configEnv.UseGoldBoost or configEnv.GoldPotionHours == 0 then
+        print("[POTION] Disabled by effective config; skipping.")
+        return
+    end
+    local targetSeconds = configEnv.GoldPotionHours * 3600
+    local interface = awaitPath(player, {"PlayerGui", "Interface"})
+    local function timer()
+        local value = findPath(player, {"Boosts", "Gold"})
+        if value and (value:IsA("NumberValue") or value:IsA("IntValue"))
+            and value.Value >= 0 and value.Value < math.huge then return value.Value end
+    end
+    local initial = timer()
+    assert(initial, "Gold Potion timer unavailable; purchases skipped.")
+    print("[POTION] Remaining=" .. initial .. "s | Target=" .. targetSeconds .. "s")
+    if initial >= targetSeconds - 10 then
+        print("[AUTO PRESTIGE] Gold Potion target already met. Remaining seconds: " .. initial)
+        return
+    end
+    local shop = require(ReplicatedStorage.Modules.Storage.Shop)
+    local products = {
+        {index = 9, tag = "2x Gold Boost [2h]", cost = 2799, seconds = 7200},
+        {index = 8, tag = "2x Gold Boost [1h]", cost = 1599, seconds = 3600},
+        {index = 7, tag = "2x Gold Boost [30m]", cost = 999, seconds = 1800},
+    }
+    for _, product in ipairs(products) do
+        local entry = shop["2_Boosts"] and shop["2_Boosts"][product.index]
+        assert(entry and entry.Tag == product.tag and entry.Currency == "Pumpkins" and entry.Cost == product.cost,
+            "Gold Potion product/price changed; purchases skipped.")
+    end
+    -- Market.Update binds Held to Pumpkins only when the Event category is selected.
+    local market = awaitPath(interface, {"Market"})
+    if not isVisible(market) then
+        click(awaitPath(interface, {"Topbar", "Main", "Categories", "Market", "Interact"}))
+        assert(waitForValue(function() return isVisible(market) end), "Market did not open; no purchase sent.")
+    end
+    task.wait(1)
+    local eventBoosts = awaitPath(market, {"Main", "Items", "2_Boosts"})
+    for _ = 1, 4 do
+        if eventBoosts.Visible then break end
+        click(awaitPath(market, {"Main", "Currency_Swap"}), "MouseButton1Click")
+        task.wait(1)
+    end
+    assert(eventBoosts.Visible and isVisible(market), "Event Shop unavailable; never falling back to Gems.")
+    local held = awaitPath(market, {"Main", "Held"})
+    local items = require(ReplicatedStorage.Modules.Storage.Items)
+    local currencyIcon = held:FindFirstChild("Currency")
+    local pumpkin = items.Pumpkins
+    assert(pumpkin and currencyIcon and tostring(currencyIcon.Image):match("(%d+)$")
+        == tostring(pumpkin.Image):match("(%d+)$"), "Market currency is not confirmed as Pumpkins.")
+    local label = awaitPath(held, {"Amount"})
+    local balance, lastBalance, stableSince
+    local balanceDeadline = os.clock() + 20
+    repeat
+        local text = label.Text:gsub("<[^>]*>", ""):gsub(",", ""):gsub("%s", "")
+        balance = text:match("^%d+$") and tonumber(text)
+        if balance and balance == lastBalance then
+            stableSince = stableSince or os.clock()
+        else
+            stableSince = nil
+        end
+        lastBalance = balance
+        if stableSince and os.clock() - stableSince >= (balance == 0 and 5 or 2) then break end
+        task.wait(0.2)
+    until os.clock() >= balanceDeadline
+    assert(balance and balance >= 0 and balance < math.huge, "Exact Pumpkins unavailable; purchases skipped.")
+    print("[POTION] Pumpkins available: " .. balance)
+    local remote = awaitPath(ReplicatedStorage, {"Assets", "Remotes", "GET"})
+    -- Recheck after claiming/UI transitions in case a potion was activated meanwhile.
+    local current = timer()
+    assert(current, "Gold Potion timer unavailable after claims.")
+    -- Ignore ten seconds of countdown drift; never buy another whole potion for that alone.
+    if current >= targetSeconds - 10 then return end
+    local remainingSeconds = math.ceil((targetSeconds - current - 10) / 1800) * 1800
+    local limit = math.min(math.floor(balance / 999), math.ceil(remainingSeconds / 1800))
+    for _ = 1, limit do
+        local live = timer()
+        assert(live, "Potion timer lost; stopping purchases.")
+        if live >= targetSeconds - 10 then break end
+        remainingSeconds = math.min(remainingSeconds,
+            math.ceil((targetSeconds - live - 10) / 1800) * 1800)
+        local product = chooseGoldPotion(balance, products, remainingSeconds)
+        if not product then break end
+        assert(timer(), "Potion timer lost; stopping purchases.")
+        print("[AUTO PRESTIGE] Buying " .. product.tag .. " for " .. product.cost .. " Pumpkins.")
+        local data = remote:InvokeServer("S_Market", "Buy", "2_Boosts", product.index, 1)
+        assert(type(data) == "table", "Potion purchase refused/unconfirmed; no retry.")
+        local slot = data.Slots and data.Slots[data.Current_Slot]
+        local remaining = slot and slot.Currency and slot.Currency.Pumpkins
+        assert(type(remaining) == "number" and remaining >= 0 and remaining < balance,
+            "Purchase balance not confirmed; stopping without retry.")
+        balance = remaining
+        -- Subtract purchased duration so countdown during requests cannot trigger extra purchases.
+        remainingSeconds = remainingSeconds - product.seconds
+        local before = timer()
+        assert(before, "Potion bought but timer lost; leaving item in inventory.")
+        remote:InvokeServer("S_Inventory", "Item", product.tag)
+        assert(waitForValue(function()
+            local after = timer()
+            return after and after - before >= product.seconds - 60
+        end), "Potion use not confirmed; no further purchase or use.")
+        print("[AUTO PRESTIGE] Potion confirmed; Pumpkins: " .. balance .. " | Timer: " .. tostring(timer()))
+        local seconds = math.floor(timer())
+        sendLobbyResult("GOLD POTION USED", {
+            {name = "Potion", value = product.tag, inline = true},
+            {name = "Pumpkins remaining", value = tostring(balance), inline = true},
+            {name = "Gold Boost Remaining Time", value = string.format("%02d:%02d:%02d",
+                math.floor(seconds / 3600), math.floor(seconds / 60) % 60, seconds % 60), inline = true},
+        })
+        task.wait(0.3)
+    end
+    local final = timer()
+    if final and final >= targetSeconds - 10 then
+        print("[POTION] Target reached: " .. final .. "s | Pumpkins: " .. balance)
+    else
+        warn("[POTION] Target NOT reached: remaining=" .. tostring(final) .. "s / " .. targetSeconds
+            .. "s | Pumpkins=" .. balance .. "; continuing farm without claiming success.")
+    end
+end
+
+local function waitLobbyAutoexec(player)
+    print("[AUTO PRESTIGE] Autoexec: waiting at least 15 seconds for Lobby initialization...")
+    local started = os.clock()
+    local stableSince, previousUI
+    repeat
+        local ui = findPath(player, {"PlayerGui", "Interface"})
+        local root = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+        local ready = root and ui and findPath(ui, {"Topbar", "Main", "Categories", "Quests", "Interact"})
+            and findPath(ui, {"Topbar", "Main", "Categories", "Equipment", "Interact"})
+            and findPath(ui, {"Topbar", "Main", "Icons", "Achievements"})
+            and findPath(ui, {"Quests", "Main", "Details"})
+            and ui:FindFirstChild("Equipment") and ui:FindFirstChild("Achievements")
+            and findPath(player, {"Boosts", "Gold"})
+        if ready and ui == previousUI then
+            stableSince = stableSince or os.clock()
+        else
+            stableSince = nil
+        end
+        previousUI = ui
+        if stableSince and os.clock() - stableSince >= 3 and os.clock() - started >= 15 then
+            print("[AUTO PRESTIGE] Lobby UI loaded; starting menu setup.")
+            return
+        end
+        task.wait(0.25)
+    until os.clock() - started >= 120
+    error("Lobby UI initialization timed out; no claim or purchase started.")
+end
+
 local function runPrestigeFlow()
     -- A new execution resumes the appropriate branch after each place teleport.
     if inMission() then
         print("[AUTO PRESTIGE] Map: Auto Farm + Retry + Skip + Rewards Webhook.")
+        print("[POTION] Mission branch: top-up purchases run in Lobby, not inside missions.")
         startRewardsWebhook()
         startLobbyTimer()
         startMissionFarm()
@@ -1926,16 +2395,23 @@ local function runPrestigeFlow()
     end
     local player = waitForValue(function() return Players.LocalPlayer end)
     assert(player, "LocalPlayer did not load.")
+    waitLobbyAutoexec(player)
     ensureLobby2D(player)
 
     -- Background balance capture must run in Lobby too, to carry Gold/Gems into map.
     startRewardsWebhook()
-    print("[AUTO PRESTIGE] Lobby: Claim All -> Upgrade All -> read Grade.")
+    print("[AUTO PRESTIGE] Lobby: Achievements -> Quests -> Gold Potion -> Prestige -> Upgrades.")
     claimAllAchievements(player)
+    local questsOK, questsError = pcall(claimQuestNotifications, player)
+    if not questsOK then
+        warn("[AUTO PRESTIGE] Quests skipped; continuing Lobby setup: " .. tostring(questsError))
+    end
     -- Prestige is checked before Upgrade All can spend the threshold balance.
+    local boosted, boostError = pcall(ensureGoldPotion, player)
+    if not boosted then warn("[AUTO PRESTIGE] Gold Potion skipped: " .. tostring(boostError)) end
     tryPrestige(player)
     local difficulty = readDifficulty(player)
-    print("[AUTO PRESTIGE] Mission: Shiganshina/Breach -> 11 modifiers -> Start.")
+    print("[AUTO PRESTIGE] Mission: Shiganshina/Breach -> configured modifiers -> Start.")
     startMission(player, difficulty)
 end
 
